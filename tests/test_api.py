@@ -6,6 +6,7 @@ Memory tests are skipped until supabase/schema.sql has been applied.
 
 from __future__ import annotations
 
+import json
 import os
 
 import pytest
@@ -174,3 +175,83 @@ def test_make_caption_limits() -> None:
     assert limit_caption(" ".join(["w"] * 60)).endswith("…")
     assert len(limit_caption(" ".join(["w"] * 60)).split()) == 40
     assert strip_formatting("**Hi** see [docs](https://x.y)\n<stats>\n[]\n</stats>") == "Hi see docs"
+
+
+# ------------------------------------------------------------- CLI support
+
+
+def _creds() -> dict[str, str]:
+    email, password = os.getenv("BAYMON_TEST_EMAIL"), os.getenv("BAYMON_TEST_PASSWORD")
+    if not (email and password):
+        pytest.skip("BAYMON_TEST_EMAIL / BAYMON_TEST_PASSWORD not set")
+    return {"email": email, "password": password}
+
+
+def test_login_and_refresh() -> None:
+    resp = client.post("/v1/auth/login", json=_creds())
+    assert resp.status_code == 200, resp.text
+    session = resp.json()
+    assert session["user"]["email"] == os.environ["BAYMON_TEST_EMAIL"] and session["expires_at"]
+    me = client.get("/v1/me", headers={"Authorization": f"Bearer {session['access_token']}"})
+    assert me.status_code == 200
+    refreshed = client.post("/v1/auth/refresh", json={"refresh_token": session["refresh_token"]})
+    assert refreshed.status_code == 200 and refreshed.json()["access_token"]
+
+
+def test_login_rejects_wrong_password() -> None:
+    resp = client.post("/v1/auth/login", json={**_creds(), "password": "definitely-wrong"})
+    assert resp.status_code == 401
+    assert resp.json()["error"]["code"] == "invalid_credentials"
+
+
+def test_models(auth: dict[str, str]) -> None:
+    models = client.get("/v1/models", headers=auth).json()
+    keys = {m["key"] for m in models}
+    assert {"gpt-oss-120b", "minimax-m2.7"} <= keys
+    assert sum(m["default"] for m in models) == 1
+
+
+def _agent_events(auth: dict[str, str], body: dict) -> list[dict]:
+    with client.stream("POST", "/v1/agent/complete", headers=auth, json=body) as resp:
+        assert resp.status_code == 200, resp.read()
+        return [json.loads(line) for line in resp.iter_lines() if line.strip()]
+
+
+def test_agent_tool_round_trip(auth: dict[str, str]) -> None:
+    tool = {"type": "function", "function": {
+        "name": "read_file", "description": "Read a file",
+        "parameters": {"type": "object", "properties": {"path": {"type": "string"}}, "required": ["path"]}}}
+    messages = [{"role": "user", "content": "What does notes.txt say? Use the read_file tool."}]
+    events = _agent_events(auth, {"messages": messages, "tools": [tool], "environment": {"cwd": "/tmp"}})
+    calls = next(e["tool_calls"] for e in events if e["type"] == "tool_calls")
+    assert calls[0]["function"]["name"] == "read_file" and "notes.txt" in calls[0]["function"]["arguments"]
+    assert events[-1]["type"] == "done"
+
+    messages += [
+        {"role": "assistant", "content": None, "tool_calls": calls},
+        {"role": "tool", "tool_call_id": calls[0]["id"], "content": "The meeting moved to 4pm."},
+    ]
+    events = _agent_events(auth, {"messages": messages, "tools": [tool]})
+    text = "".join(e["delta"] for e in events if e["type"] == "text")
+    assert "4" in text and events[-1]["finish_reason"] == "stop"
+
+
+def test_agent_unknown_and_unavailable_models(auth: dict[str, str]) -> None:
+    body = {"messages": [{"role": "user", "content": "hi"}]}
+    bad = client.post("/v1/agent/complete", headers=auth, json={**body, "model": "nope"})
+    assert bad.status_code == 422 and bad.json()["error"]["code"] == "invalid_request"
+    mm = client.post("/v1/agent/complete", headers=auth, json={**body, "model": "minimax-m2.7"})
+    assert mm.status_code in (200, 403)  # 403 model_unavailable until Groq enables the preview
+
+
+def test_observe_is_accepted(auth: dict[str, str]) -> None:
+    resp = client.post("/v1/memory/observe", headers=auth, json={"user_message": "what's 2+2", "reply": "4"})
+    assert resp.status_code == 202 and resp.json() == {"queued": True}
+
+
+def test_speak_reply_caption(auth: dict[str, str]) -> None:
+    long = "Here's the plan:\n\n```python\nprint('x')\n```\n\n" + "More detail here. " * 30
+    body = client.post("/v1/speak/reply", headers=auth, json={"text": long}).json()
+    assert 0 < len(body["caption"].split()) <= 40 and "```" not in body["caption"]
+    if body["audio_base64"] is None:
+        assert body["warnings"], "missing audio must come with a warning"

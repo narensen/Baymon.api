@@ -1,0 +1,67 @@
+name: Build CLI
+
+# Builds the Baymon CLI for Linux (.deb) and Windows (.exe).
+# Runs on version tags (v0.2.0) and on demand. Tagged builds are attached to a GitHub release.
+# Set the repository variable BAYMON_DEFAULT_API_URL to bake your server URL into the builds.
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  deb:
+    # Oldest supported runner: binaries built against an older glibc run on more distros.
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+      - name: Build .deb
+        run: scripts/build_deb.sh
+        env:
+          BAYMON_DEFAULT_API_URL: ${{ vars.BAYMON_DEFAULT_API_URL }}
+      - name: Smoke test
+        run: |
+          sudo apt-get install -y ./dist/baymon_*.deb
+          baymon --version
+          baymon --help
+      - uses: actions/upload-artifact@v4
+        with:
+          name: baymon-linux-deb
+          path: dist/*.deb
+
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+      - name: Build .exe
+        shell: pwsh
+        run: ./scripts/build_windows.ps1
+        env:
+          BAYMON_DEFAULT_API_URL: ${{ vars.BAYMON_DEFAULT_API_URL }}
+      - name: Smoke test
+        shell: pwsh
+        run: |
+          ./dist/baymon.exe --version
+          ./dist/baymon.exe --help
+      - uses: actions/upload-artifact@v4
+        with:
+          name: baymon-windows-exe
+          path: dist/baymon.exe
+
+  release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [deb, windows]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: artifacts/*

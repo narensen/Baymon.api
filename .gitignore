@@ -11,3 +11,6 @@ wheels/
 
 # Secrets
 .env
+
+# CLI build artifacts
+src/baymon/cli/_build.py
