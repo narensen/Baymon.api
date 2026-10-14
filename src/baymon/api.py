@@ -51,7 +51,7 @@ STATUS_BY_CODE = {
 app = FastAPI(title="Baymon API", version="0.1.0")
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=CORS_ORIGINS,
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
