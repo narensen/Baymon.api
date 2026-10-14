@@ -38,6 +38,8 @@ MAX_AUDIO_BYTES = 25 * 1024 * 1024  # Groq's direct-upload limit
 STATUS_BY_CODE = {
     "unauthorized": 401,
     "memory_not_found": 404,
+    "user_not_found": 404,
+    "memory_conflict": 409,
     "invalid_memory": 422,
     "audio_empty": 422,
     "audio_too_large": 413,

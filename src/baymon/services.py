@@ -3,7 +3,7 @@
 Auth is handled outside (JS layer); callers pass in the authenticated user_id.
 Everything here is stateless except the explicit memory read/write in Supabase.
 
-Memory lives in a JSONB column (default: ``profiles.memory``) as a list of
+Memory lives in a JSONB column (``memory.memory -> 'items'``, one row per user) as a list of
 ``{"content", "category", "created_at"}`` objects. See ``supabase/schema.sql``.
 """
 
@@ -20,7 +20,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from functools import cache
 from pathlib import Path
-from typing import Any, BinaryIO
+from typing import Any, BinaryIO, Callable
 
 import groq
 from dotenv import load_dotenv
@@ -33,10 +33,12 @@ TEXT_MODEL = os.getenv("BAYMON_TEXT_MODEL", "openai/gpt-oss-120b")
 STT_MODEL = os.getenv("BAYMON_STT_MODEL", "whisper-large-v3-turbo")
 TTS_MODEL = os.getenv("BAYMON_TTS_MODEL", "canopylabs/orpheus-v1-english")
 TTS_VOICE = os.getenv("BAYMON_TTS_VOICE", "troy")
-MEMORY_TABLE = "profiles"
+MEMORY_TABLE = "memory"
+USER_ID_COLUMN = "user_id"
 MEMORY_COLUMN = "memory"
 MEMORY_CATEGORIES = ("preference", "fact", "task", "decision", "other")
 MEMORY_MAX_CHARS = 500
+MEMORY_WRITE_RETRIES = 5
 
 # Orpheus on Groq accepts at most ~200 characters per request.
 TTS_MAX_CHARS = 200
@@ -238,28 +240,72 @@ def listen(
 # --------------------------------------------------------------------------
 
 
-def _load_memory(user_id: str) -> list[dict[str, Any]]:
+def _load_row(user_id: str) -> tuple[dict[str, Any], int] | None:
+    """Return (memory JSON object, version) for the user, or None if no row exists."""
     try:
         resp = (
             _supabase()
             .table(MEMORY_TABLE)
-            .select(MEMORY_COLUMN)
-            .eq("id", user_id)
+            .select(f"{MEMORY_COLUMN}, version")
+            .eq(USER_ID_COLUMN, user_id)
             .limit(1)
             .execute()
         )
     except Exception as exc:
         raise ServiceError(f"Couldn't load memory: {exc}", "memory_read") from exc
-    row: Any = resp.data[0] if resp.data else {}
-    memory = row.get(MEMORY_COLUMN) if isinstance(row, dict) else None
-    return [m for m in memory if isinstance(m, dict)] if isinstance(memory, list) else []
+    if not resp.data:
+        return None
+    row: Any = resp.data[0]
+    memory = row.get(MEMORY_COLUMN)
+    return (memory if isinstance(memory, dict) else {}), int(row.get("version") or 1)
 
 
-def _rpc(fn: str, params: dict[str, Any]) -> Any:
-    try:
-        return _supabase().rpc(fn, params).execute().data
-    except Exception as exc:
-        raise ServiceError(f"Couldn't update memory: {exc}", "memory_write") from exc
+def _items(memory: dict[str, Any]) -> list[dict[str, Any]]:
+    items = memory.get("items")
+    return [m for m in items if isinstance(m, dict)] if isinstance(items, list) else []
+
+
+def _load_memory(user_id: str) -> list[dict[str, Any]]:
+    row = _load_row(user_id)
+    return _items(row[0]) if row else []
+
+
+def _mutate(user_id: str, change: Callable[[list[dict[str, Any]]], list[dict[str, Any]]]) -> None:
+    """Apply ``change`` to the user's memory items with optimistic locking on ``version``.
+
+    Other keys in the memory JSON are preserved. Retries if another write landed
+    between the read and the update.
+    """
+    table = _supabase().table(MEMORY_TABLE)
+    for _ in range(MEMORY_WRITE_RETRIES):
+        row = _load_row(user_id)
+        try:
+            if row is None:
+                table.insert({USER_ID_COLUMN: user_id, MEMORY_COLUMN: {"items": change([])}}).execute()
+                return
+            memory, version = row
+            resp = (
+                table.update({MEMORY_COLUMN: {**memory, "items": change(_items(memory))}, "version": version + 1})
+                .eq(USER_ID_COLUMN, user_id)
+                .eq("version", version)
+                .execute()
+            )
+        except ServiceError:
+            raise
+        except Exception as exc:
+            text = str(exc)
+            if "23505" in text:  # concurrent insert won the race; retry as an update
+                continue
+            if "23503" in text:
+                raise ServiceError("No users row for this account.", "user_not_found") from exc
+            raise ServiceError(f"Couldn't save memory: {exc}", "memory_write") from exc
+        if resp.data:
+            return
+    raise ServiceError("Memory is being updated elsewhere; try again.", "memory_conflict")
+
+
+def _append(user_id: str, items: list[dict[str, Any]]) -> None:
+    _mutate(user_id, lambda current: current + items)
 
 
 def _new_memory(content: str, category: str, metadata: dict | None = None) -> dict[str, Any]:
@@ -290,7 +336,7 @@ def list_memory(user_id: str) -> list[dict[str, Any]]:
 def add_memory(user_id: str, content: str, category: str = "other", metadata: dict | None = None) -> dict[str, Any]:
     """Store a memory verbatim (no AI involved). Returns the stored item."""
     item = _new_memory(content, category, metadata)
-    _rpc("append_memory", {"p_user_id": user_id, "p_items": [item]})
+    _append(user_id, [item])
     return item
 
 
@@ -306,15 +352,27 @@ def update_memory(user_id: str, memory_id: str, content: str | None = None, cate
     if not patch:
         raise ServiceError("Nothing to update.", "invalid_memory")
     patch["updated_at"] = datetime.now(timezone.utc).isoformat()
-    item = _rpc("update_memory", {"p_user_id": user_id, "p_memory_id": memory_id, "p_patch": patch})
-    if not item:
-        raise ServiceError("Memory not found.", "memory_not_found")
-    return item
+
+    updated: dict[str, Any] = {}
+
+    def change(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        if not any(m.get("id") == memory_id for m in items):
+            raise ServiceError("Memory not found.", "memory_not_found")
+        out = [{**m, **patch} if m.get("id") == memory_id else m for m in items]
+        updated.update(next(m for m in out if m.get("id") == memory_id))
+        return out
+
+    _mutate(user_id, change)
+    return updated
 
 
 def delete_memory(user_id: str, memory_id: str) -> None:
-    if not _rpc("remove_memory", {"p_user_id": user_id, "p_memory_id": memory_id}):
-        raise ServiceError("Memory not found.", "memory_not_found")
+    def change(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        if not any(m.get("id") == memory_id for m in items):
+            raise ServiceError("Memory not found.", "memory_not_found")
+        return [m for m in items if m.get("id") != memory_id]
+
+    _mutate(user_id, change)
 
 
 def _format_memory(memory: list[dict[str, Any]]) -> str:
@@ -341,7 +399,7 @@ def extract_memories(user_id: str, content: str, metadata: dict | None = None) -
         new_items.append(_new_memory(text, str(item.get("category", "other")), metadata))
 
     if new_items:
-        _rpc("append_memory", {"p_user_id": user_id, "p_items": new_items})
+        _append(user_id, new_items)
     return new_items
 
 

@@ -35,7 +35,7 @@ uv run baymon          # hands-free voice chat in the terminal
 
 ### Database
 
-Run [`supabase/schema.sql`](supabase/schema.sql) once in the Supabase SQL Editor. It creates the `profiles` table (one row per user, `memory` JSONB array), a trigger that creates a profile for every new user, and the `append_memory` / `update_memory` / `remove_memory` functions used for atomic memory writes.
+Memory is stored in the `public.memory` table: one row per user (`user_id` → `users.user_id`), with memories under `memory -> 'items'`. Concurrent writes are safe via optimistic locking on the `version` column, so no database functions are needed. The row is created automatically on first write; the user must already exist in `users`. See [`supabase/schema.sql`](supabase/schema.sql).
 
 ## Terminal chat
 
