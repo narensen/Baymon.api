@@ -27,6 +27,8 @@ from dotenv import load_dotenv
 from groq import Groq
 from supabase import Client, create_client
 
+from baymon.formatting import FORMATTING_PROMPT, TALK_FORMATTING_PROMPT
+
 load_dotenv()
 
 TEXT_MODEL = os.getenv("BAYMON_TEXT_MODEL", "openai/gpt-oss-120b")
@@ -55,7 +57,9 @@ for depth. Use Markdown when it helps (code blocks, lists)."""
 
 MODE_PROMPTS = {
     "talk": "The user is in talk mode: they are speaking to you hands-free and your "
-    "reply will be read aloud, so keep it conversational.",
+    "reply will be read aloud, so keep it conversational.\n"
+    "Reply in plain spoken English: no Markdown, no lists, no UI tags, no URLs, no code.\n"
+    "Keep it to one or two sentences unless the user explicitly asks for more detail.",
     "type": "The user is in type mode: they are typing and reading your replies on screen.",
 }
 
@@ -87,7 +91,7 @@ Use "summary" when the reply contains code, tables, long lists, URLs, file paths
 heavy Markdown, or is longer than a few sentences. The spoken version should be \
 short, natural conversational speech in the assistant's own first-person voice \
 (e.g. "Here's a function that..." — never "The reply shows..."). Point the user \
-to the screen for details, never read code or symbols aloud, no Markdown. \
+to the screen for details, never read code, symbols or <tags> (or their JSON) aloud, no Markdown. \
 Otherwise use "same".
 
 Respond with JSON only: {"mode": "same" | "summary", "speech": "<text to speak>"}
@@ -224,7 +228,8 @@ def listen(
             model=STT_MODEL,
             response_format="json",
             temperature=0.0,
-            **({"prompt": prompt} if prompt else {}),
+            # Groq rejects prompts over 896 chars; keep the most recent context.
+            **({"prompt": prompt[-896:]} if prompt else {}),
         )
     except groq.GroqError as exc:
         raise _wrap_groq_error(exc, "transcribe audio") from exc
@@ -426,6 +431,7 @@ def _generate(user_input: str, session_context: dict, user_id: str) -> tuple[str
     mode = session_context.get("mode")
     if mode in MODE_PROMPTS:
         system += f"\n\n{MODE_PROMPTS[mode]}"
+    system += f"\n\n{TALK_FORMATTING_PROMPT if mode == 'talk' else FORMATTING_PROMPT}"
     if memory_text := _format_memory(memory):
         system += f"\n\nWhat you remember about the user:\n{memory_text}"
 
@@ -479,7 +485,7 @@ def generate_text(user_input: str, session_context: dict, user_id: str) -> str:
 
 def _looks_speakable(text: str) -> bool:
     """Cheap pre-check so short plain replies skip the extra model call."""
-    return len(text) <= 300 and not re.search(r"```|^\s*[|#>-]|https?://|`", text, re.MULTILINE)
+    return len(text) <= 300 and not re.search(r"```|^\s*[|#>\-<]|https?://|`", text, re.MULTILINE)
 
 
 def decide_speech_text(text: str) -> str:
@@ -492,6 +498,69 @@ def decide_speech_text(text: str) -> str:
     decision = _chat_json(SPEECH_DECISION_PROMPT, text)
     speech = str(decision.get("speech") or "").strip()
     return speech or text
+
+
+CAPTION_MAX_WORDS = 40
+CAPTION_MAX_SENTENCES = 2
+_UI_TAG_BLOCK = re.compile(r"^<([a-z]+)\b[^>\n]*>.*?^</\1>[ \t]*$", re.S | re.M)
+
+
+def strip_formatting(text: str) -> str:
+    """Reduce Markdown + UI tags to plain speakable prose."""
+    text = re.sub(r"```.*?(```|$)", " ", text, flags=re.S)  # code blocks
+    text = _UI_TAG_BLOCK.sub(" ", text)  # <schedule>…</schedule> etc.
+    text = re.sub(r"</?[a-z]+\b[^>\n]*>", " ", text)  # stray tags
+    text = re.sub(r"!?\[([^\]]*)\]\([^)]*\)", r"\1", text)  # [label](url) -> label
+    text = re.sub(r"https?://\S+", " ", text)
+    text = re.sub(r"^\s*(#{1,6}|>|[-*+]|\d+[.)])\s+", "", text, flags=re.M)  # headings, quotes, lists
+    text = re.sub(r"(\*\*|__|\*|_|`|~~)", "", text)
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def _split_sentences(text: str) -> list[str]:
+    return [p for p in re.split(r"(?<=[.!?…])\s+", text.strip()) if p]
+
+
+def limit_caption(text: str, max_words: int = CAPTION_MAX_WORDS, max_sentences: int = CAPTION_MAX_SENTENCES) -> str:
+    """Hard-limit to whole sentences within the budget, else the first max_words words + ellipsis."""
+    kept: list[str] = []
+    words = 0
+    for sentence in _split_sentences(text)[:max_sentences]:
+        n = len(sentence.split())
+        if words + n > max_words:
+            break
+        kept.append(sentence)
+        words += n
+    if kept:
+        return " ".join(kept)
+    cut = " ".join(text.split()[:max_words]).rstrip(",;:-—")
+    return f"{cut}…" if cut else ""
+
+
+def _fits_caption(text: str, max_words: int) -> bool:
+    return 0 < len(text.split()) <= max_words and len(_split_sentences(text)) <= CAPTION_MAX_SENTENCES
+
+
+def make_caption(text: str, max_words: int = CAPTION_MAX_WORDS) -> str:
+    """Exactly what will be spoken: plain text, at most 2 sentences and ``max_words`` words.
+
+    Short plain replies are used as-is (formatting stripped); anything else gets a
+    first-person spoken summary from the model, then the limit is enforced in code.
+    """
+    has_structure = re.search(r"```|^\s*<[a-z]+\b|^\s*\|", text, re.M)
+    plain = strip_formatting(text)
+    if not has_structure and _fits_caption(plain, max_words):
+        return plain
+    budget = (
+        f"\nThe spoken version must be at most {CAPTION_MAX_SENTENCES} sentences and {max_words} words. "
+        'Always use "summary" unless the reply already fits.'
+    )
+    try:
+        speech = str(_chat_json(SPEECH_DECISION_PROMPT + budget, text).get("speech") or "")
+    except ServiceError:
+        speech = ""
+    caption = limit_caption(strip_formatting(speech) or plain, max_words)
+    return caption or "The details are on screen."
 
 
 # --------------------------------------------------------------------------

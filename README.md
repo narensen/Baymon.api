@@ -83,6 +83,7 @@ fetch("http://localhost:8000/v1/chat", {
 | `GET /health` | Liveness check (no auth) |
 | `GET /v1/me` | Signed-in user |
 | `POST /v1/chat` | `{message, history?, voice?, mode?, tts_voice?}` → `{text, speech_text, audio_base64, audio_mime, mode, warnings}` |
+| `POST /v1/talk` | One hands-free voice turn. Multipart `file` + optional `history` (JSON string) and `tts_voice` → `{transcript, text, caption, audio_base64, audio_mime, mode, warnings}`. `caption` is exactly what's spoken: plain text, ≤ 2 sentences / 40 words |
 | `POST /v1/transcribe` | Multipart `file` (webm, wav, mp3, m4a, ogg, flac…; ≤ 25 MB), optional `prompt` → `{text}` |
 | `POST /v1/speak` | `{text, voice?}` → `audio/wav` |
 | `GET /v1/memory` | `{items: [...]}` |

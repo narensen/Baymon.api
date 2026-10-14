@@ -20,7 +20,7 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, Response
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, TypeAdapter, ValidationError
 from supabase_auth.errors import AuthError
 
 from baymon import services
@@ -41,6 +41,7 @@ STATUS_BY_CODE = {
     "user_not_found": 404,
     "memory_conflict": 409,
     "invalid_memory": 422,
+    "invalid_request": 422,
     "audio_empty": 422,
     "audio_too_large": 413,
     "transcription_empty": 422,
@@ -205,6 +206,20 @@ class Transcription(BaseModel):
     text: str
 
 
+class TalkResponse(BaseModel):
+    transcript: str = Field(description="What Whisper heard; the user's message.")
+    text: str = Field(description="Full reply, as stored in history.")
+    caption: str = Field(description="Exactly the words spoken: plain text, at most 2 sentences / 40 words.")
+    audio_base64: str | None = Field(None, description="WAV of caption, base64-encoded; null if speech failed.")
+    audio_mime: str | None = None
+    mode: Literal["type"] | None = Field(None, description='"type" if the user asked to switch to typing.')
+    warnings: list[ErrorInfo] = Field(default_factory=list)
+
+
+_history_adapter = TypeAdapter(list[ChatMessage])
+WHISPER_PROMPT_CHARS = 896  # Groq rejects longer Whisper prompts
+
+
 # --------------------------------------------------------------------------
 # Routes
 # --------------------------------------------------------------------------
@@ -259,6 +274,62 @@ def transcribe(
     if len(data) > MAX_AUDIO_BYTES:
         raise ServiceError("Audio file is too large (max 25 MB).", "audio_too_large")
     return Transcription(text=services.listen(data, file.filename or "audio.webm", prompt=prompt))
+
+
+def _parse_history(raw: str | None) -> list[dict[str, str]]:
+    if not raw:
+        return []
+    try:
+        turns = _history_adapter.validate_json(raw)
+    except ValidationError as exc:
+        first = exc.errors()[0]
+        where = ".".join(str(p) for p in first.get("loc", ()))
+        raise ServiceError(f"history{'.' + where if where else ''}: {first.get('msg')}", "invalid_request") from exc
+    return [t.model_dump() for t in turns[-40:]]
+
+
+def _whisper_prompt(turns: list[dict[str, str]]) -> str | None:
+    """Context for Whisper: the tail of the last thing Baymon said."""
+    last = next((t["content"] for t in reversed(turns) if t["role"] == "assistant"), "")
+    return services.strip_formatting(last)[-WHISPER_PROMPT_CHARS:] or None
+
+
+@app.post("/v1/talk")
+def talk(
+    user: CurrentUser,
+    background: BackgroundTasks,
+    file: Annotated[UploadFile, File(description="Recording: m4a (iOS/Android) or webm (web), max 25 MB")],
+    history: Annotated[str | None, Form(description="JSON array of {role, content}")] = None,
+    tts_voice: Annotated[Voice | None, Form()] = None,
+) -> TalkResponse:
+    """One hands-free voice turn: transcribe, reply, caption, speak."""
+    data = file.file.read(MAX_AUDIO_BYTES + 1)
+    if len(data) > MAX_AUDIO_BYTES:
+        raise ServiceError("Audio file is too large (max 25 MB).", "audio_too_large")
+    turns = _parse_history(history)
+    transcript = services.listen(data, file.filename or "audio.m4a", prompt=_whisper_prompt(turns))
+
+    context: dict[str, Any] = {"history": turns, "mode": "talk", **({"voice": tts_voice} if tts_voice else {})}
+    result = services.run_turn(user.id, transcript, context, voice_mode=False, remember=False)
+
+    caption = services.make_caption(result.text)
+    warnings = [ErrorInfo(code=e.code, message=e.message) for e in result.errors]
+    audio = None
+    try:
+        audio = services.generate_audio(caption, context)
+    except ServiceError as exc:
+        warnings.append(ErrorInfo(code=exc.code, message=exc.message))
+
+    background.add_task(_remember_turn, user.id, transcript, result.text, "voice")
+    return TalkResponse(
+        transcript=transcript,
+        text=result.text,
+        caption=caption,
+        audio_base64=base64.b64encode(audio).decode() if audio else None,
+        audio_mime="audio/wav" if audio else None,
+        mode="type" if result.mode == "type" else None,
+        warnings=warnings,
+    )
 
 
 @app.post("/v1/speak", response_class=Response, responses={200: {"content": {"audio/wav": {}}}})

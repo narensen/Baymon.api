@@ -128,3 +128,49 @@ def test_memory_import(auth: dict[str, str], schema_ready: None) -> None:
         for m in items:
             client.delete(f"/v1/memory/{m['id']}", headers=auth)
 
+
+
+FIXTURE = os.path.join(os.path.dirname(__file__), "fixtures", "trip.wav")
+
+
+def _talk(auth: dict[str, str], **form: str):
+    with open(FIXTURE, "rb") as f:
+        return client.post("/v1/talk", headers=auth, files={"file": ("turn.wav", f, "audio/wav")}, data=form)
+
+
+def test_talk_turn(auth: dict[str, str]) -> None:
+    history = '[{"role": "user", "content": "hi"}, {"role": "assistant", "content": "Hey! What are you planning?"}]'
+    resp = _talk(auth, history=history, tts_voice="hannah")
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert "mountain" in body["transcript"].lower()
+    assert body["text"] and "<" not in body["text"]
+    caption = body["caption"]
+    assert 0 < len(caption.split()) <= 40
+    assert not any(c in caption for c in "<>*`#|") and "http" not in caption
+    assert body["mode"] is None
+    if body["audio_base64"] is None:
+        assert any(w["code"] == "groq_rate_limit" for w in body["warnings"])
+    else:
+        assert body["audio_mime"] == "audio/wav"
+
+
+def test_talk_rejects_bad_history(auth: dict[str, str]) -> None:
+    resp = _talk(auth, history='[{"role": "system", "content": "x"}]')
+    assert resp.status_code == 422
+    assert resp.json()["error"]["code"] == "invalid_request"
+
+
+def test_talk_empty_audio(auth: dict[str, str]) -> None:
+    resp = client.post("/v1/talk", headers=auth, files={"file": ("turn.m4a", b"", "audio/mp4")})
+    assert resp.status_code == 422
+    assert resp.json()["error"]["code"] == "audio_empty"
+
+
+def test_make_caption_limits() -> None:
+    from baymon.services import limit_caption, strip_formatting
+
+    assert limit_caption("One two. Three four. Five six.") == "One two. Three four."
+    assert limit_caption(" ".join(["w"] * 60)).endswith("…")
+    assert len(limit_caption(" ".join(["w"] * 60)).split()) == 40
+    assert strip_formatting("**Hi** see [docs](https://x.y)\n<stats>\n[]\n</stats>") == "Hi see docs"
