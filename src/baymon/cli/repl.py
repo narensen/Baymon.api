@@ -16,7 +16,7 @@ from baymon import __version__
 from baymon.cli import audio
 from baymon.cli.agent import Agent, TurnResult
 from baymon.cli.client import ApiError, Client
-from baymon.cli.config import VOICES, Config, config_dir
+from baymon.cli.config import Config, config_dir
 from baymon.cli.ui import UI
 
 COMMANDS: dict[str, str] = {
@@ -24,7 +24,7 @@ COMMANDS: dict[str, str] = {
     "/model": "Show or switch the model: /model [name]",
     "/talk": "Switch to hands-free voice",
     "/type": "Switch to typing",
-    "/voice": "Show or set the speaking voice: /voice [name]",
+    "/voice": "Pick Baymon's speaking voice (saved to your account): /voice [name]",
     "/memory": "List what Baymon remembers",
     "/remember": "Save a memory: /remember <text>",
     "/forget": "Delete a memory: /forget <id>",
@@ -240,7 +240,7 @@ class Session:
 
     def _speak(self, text: str) -> None:
         try:
-            caption, wav, warnings = self.client.speak_reply(text, self.config.voice)
+            caption, wav, warnings = self.client.speak_reply(text)  # server uses the saved voice
         except ApiError as exc:
             self.ui.warn(f"Couldn't speak the reply: {exc.message}")
             return
@@ -257,6 +257,41 @@ class Session:
     def set_mode(self, mode: str) -> None:
         self.mode = mode
         self.ui.info("Talk mode — just speak. Type /type to switch back." if mode == "talk" else "Type mode.")
+        if mode == "talk":
+            self._ensure_voice()
+
+    def _ensure_voice(self) -> None:
+        """Ask for a speaking voice if the user hasn't chosen one yet."""
+        try:
+            settings = self.client.settings()
+        except ApiError as exc:
+            self.ui.warn(f"Couldn't load voice settings: {exc.message}")
+            return
+        if settings.get("voice_model") is None:
+            self.ui.info("You haven't picked a voice for Baymon yet.")
+            self._pick_voice(settings["voices"])
+
+    def _pick_voice(self, voices: list[dict[str, str]], current: str | None = None) -> None:
+        console = self.ui.console
+        for i, v in enumerate(voices, 1):
+            mark = "●" if v["id"] == current else "○"
+            console.print(f"  {mark} {i}. [bold]{v['label']}[/]  [muted]{v['gender']}[/]")
+        while True:
+            choice = console.input("Pick a voice number, p<number> to hear it (e.g. p2), Enter to skip: ").strip().lower()
+            if choice.startswith("p") and choice[1:].isdigit() and 1 <= int(choice[1:]) <= len(voices):
+                previews = voices[int(choice[1:]) - 1].get("previews") or []
+                if not previews:
+                    self.ui.warn("No preview for that voice.")
+                    continue
+                try:
+                    audio.play(self.client.fetch_preview(previews[0]["url"]))
+                except (ApiError, audio.AudioError) as exc:
+                    self.ui.warn(f"Couldn't play the preview: {exc}")
+                continue
+            if choice.isdigit() and 1 <= int(choice) <= len(voices):
+                saved = self.client.set_voice(voices[int(choice) - 1]["id"])
+                self.ui.info(f"Voice: {saved['voice_model']}")
+            return
 
     # ---------------------------------------------------------- commands
 
@@ -292,14 +327,16 @@ class Session:
         elif name in ("/talk", "/type"):
             self.set_mode(name[1:])
         elif name == "/voice":
+            settings = self.client.settings()
+            ids = [v["id"] for v in settings["voices"]]
             if not arg:
-                ui.info(f"Voice: {self.config.voice}  (options: {', '.join(VOICES)})")
-            elif arg in VOICES:
-                self.config.voice = arg
-                self.config.save()
-                ui.info(f"Voice: {arg}")
+                ui.info(f"Voice: {settings['voice_model'] or 'not chosen yet'}")
+                self._pick_voice(settings["voices"], settings["voice_model"])
+            elif arg.lower() in ids:
+                saved = self.client.set_voice(arg.lower())
+                ui.info(f"Voice: {saved['voice_model']}")
             else:
-                ui.error(f"Choose one of: {', '.join(VOICES)}")
+                ui.error(f"Choose one of: {', '.join(ids)}")
         elif name == "/memory":
             items = self.client.memory_list()
             if not items:

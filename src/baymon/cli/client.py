@@ -164,6 +164,19 @@ class Client:
     def memory_observe(self, user_message: str, reply: str) -> None:
         self._send("POST", "/v1/memory/observe", json={"user_message": user_message[:20_000], "reply": reply[:40_000]})
 
+    # ------------------------------------------------------------- settings
+
+    def settings(self) -> dict[str, Any]:
+        """{"voice_model": str | None, "voices": [{"id", "label", "gender"}]}"""
+        return self._send("GET", "/v1/settings").json()
+
+    def fetch_preview(self, url: str) -> bytes:
+        """Download a pre-recorded voice preview (public, no TTS call)."""
+        return self._send("GET", url, auth=False).content
+
+    def set_voice(self, voice: str | None) -> dict[str, Any]:
+        return self._send("PATCH", "/v1/settings", json={"voice_model": voice}).json()
+
     # ---------------------------------------------------------------- voice
 
     def transcribe(self, wav: bytes, prompt: str | None = None) -> str:

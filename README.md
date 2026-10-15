@@ -164,6 +164,8 @@ fetch("http://localhost:8000/v1/chat", {
 | `GET /v1/models` | Available agent models |
 | `POST /v1/agent/complete` | One model step for a client-side agent loop. `{messages, tools, model, mode, environment}` → NDJSON stream of `text`, `reasoning`, `tool_calls`, `status`, `done`, `error` events |
 | `POST /v1/speak/reply` | `{text, voice?}` → `{caption, audio_base64, audio_mime, warnings}` |
+| `POST /v1/devices` | Phone registers `{device_id, platform, app_version, timezone, push_token, capabilities, tools}`; latest catalog wins |
+| `POST /v1/chat/{turn_id}/results` | Phone reports action results `{device_id, voice, mode, tts_voice, results}` → same shape as `/v1/chat` |
 
 Memory categories: `preference`, `fact`, `task`, `decision`, `other`.
 
@@ -173,6 +175,7 @@ Memory categories: `preference`, `fact`, `task`, `decision`, `other`.
 - Conversation history is kept by the client and sent with each `/v1/chat` call; the server is stateless.
 - After every chat turn, the AI decides in the background whether anything is worth remembering.
 - If `mode` is sent, the AI can switch modes when the user asks; the requested mode comes back in `mode`.
+- **Phone actions:** when `/v1/chat` or `/v1/talk` includes a registered `device_id`, the model can use that phone's tools. Responses then carry `turn_id`, `actions` and `awaiting_results`; the phone runs the actions and posts results to `/v1/chat/{turn_id}/results` until a response has no actions (max 25 rounds). Turns live in server memory for 10 minutes; screen and notification tools return `permission_missing` from the server when that capability is off. Run [`supabase/devices.sql`](supabase/devices.sql) to persist device catalogs across restarts (optional).
 - Errors are always `{"error": {"code", "message"}}` with a matching HTTP status (e.g. `429 groq_rate_limit`, `404 memory_not_found`). Non-fatal problems in `/v1/chat` (e.g. audio failed) come back in `warnings` alongside the text.
 
 ## Project layout

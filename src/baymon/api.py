@@ -15,18 +15,19 @@ import json
 import logging
 import os
 from collections.abc import Iterator
+from pathlib import Path
 from typing import Annotated, Any, Literal
 
 from fastapi import BackgroundTasks, Depends, FastAPI, File, Form, HTTPException, Request, UploadFile
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse, Response, StreamingResponse
+from fastapi.responses import FileResponse, JSONResponse, Response, StreamingResponse
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from pydantic import BaseModel, Field, TypeAdapter, ValidationError
 from supabase import ClientOptions, create_client
 from supabase_auth.errors import AuthError
 
-from baymon import completions, services
+from baymon import completions, devices, phone_agent, services
 from baymon.services import ServiceError
 
 log = logging.getLogger("baymon.api")
@@ -37,6 +38,7 @@ CORS_ORIGINS = [
     if o.strip()
 ]
 MAX_AUDIO_BYTES = 25 * 1024 * 1024  # Groq's direct-upload limit
+PREVIEW_DIR = Path(__file__).parent / "static" / "voice_previews"
 
 STATUS_BY_CODE = {
     "unauthorized": 401,
@@ -54,6 +56,8 @@ STATUS_BY_CODE = {
     "invalid_credentials": 401,
     "model_unavailable": 403,
     "context_too_long": 413,
+    "turn_not_found": 404,
+    "turn_busy": 409,
     "groq_unreachable": 503,
     "config_missing": 500,
 }
@@ -166,15 +170,84 @@ class ChatRequest(BaseModel):
         None, description="Current input mode; enables the AI to switch modes on request."
     )
     tts_voice: Voice | None = None
+    device_id: str | None = Field(None, max_length=200, description="Registered phone whose tools the model may use.")
+
+
+class ActionOut(BaseModel):
+    id: str
+    tool: str
+    args: dict[str, Any]
 
 
 class ChatResponse(BaseModel):
-    text: str
+    text: str = Field(description="Reply text; may be empty while actions are pending.")
     speech_text: str | None = Field(None, description="What was spoken (may be a summary of text).")
     audio_base64: str | None = Field(None, description="WAV audio, base64-encoded.")
     audio_mime: str | None = None
     mode: Literal["talk", "type"] | None = Field(None, description="Mode the user asked to switch to.")
     warnings: list[ErrorInfo] = Field(default_factory=list, description="Non-fatal failures (e.g. audio).")
+    turn_id: str | None = Field(None, description="Set when a device is involved; post action results here.")
+    actions: list[ActionOut] = Field(default_factory=list, description="Tool calls for the phone to run, in order.")
+    awaiting_results: bool = False
+    caption: str | None = Field(None, description="Exactly what is spoken (≤ 40 words), when audio is included.")
+
+
+class VoicePreview(BaseModel):
+    text: str
+    url: str = Field(description="Path on this server, e.g. /voice-previews/hannah/1.wav (no auth, cacheable).")
+
+
+class VoiceOption(BaseModel):
+    id: str
+    label: str
+    gender: str
+    previews: list[VoicePreview] = Field(default_factory=list, description="Pre-recorded sample clips.")
+
+
+class Settings(BaseModel):
+    voice_model: Voice | None = Field(description="The user's speaking voice; null means not chosen yet (ask the user).")
+    voices: list[VoiceOption] = Field(description="All available voices.")
+
+
+class SettingsUpdate(BaseModel):
+    voice_model: Voice | None = Field(description="Voice id, or null to clear the choice.")
+
+
+class DeviceToolDef(BaseModel):
+    name: str = Field(pattern=r"^[A-Za-z0-9_-]{1,64}$")
+    description: str = Field(max_length=4_000)
+    parameters: dict[str, Any] = Field(default_factory=lambda: {"type": "object", "properties": {}})
+
+
+class DeviceRegistration(BaseModel):
+    device_id: str = Field(min_length=1, max_length=200)
+    platform: str = Field("", max_length=40)
+    app_version: str = Field("", max_length=40)
+    timezone: str = Field("", max_length=64)
+    push_token: str | None = Field(None, max_length=500)
+    capabilities: dict[str, bool] = Field(default_factory=dict)
+    tools: list[DeviceToolDef] = Field(default_factory=list, max_length=128)
+
+
+class DeviceRegistered(BaseModel):
+    device_id: str
+    tools: int
+    persisted: bool = Field(description="False if stored in server memory only (no devices table).")
+
+
+class ActionResult(BaseModel):
+    action_id: str
+    status: Literal["done", "failed"]
+    output: Any = None
+    error: dict[str, Any] | None = None
+
+
+class ResultsRequest(BaseModel):
+    device_id: str = Field(min_length=1, max_length=200)
+    voice: bool = Field(False, description="Include audio of the final reply (talk mode).")
+    mode: Literal["talk", "type"] = "type"
+    tts_voice: Voice | None = None
+    results: list[ActionResult] = Field(default_factory=list, max_length=64)
 
 
 class Memory(BaseModel):
@@ -221,6 +294,9 @@ class TalkResponse(BaseModel):
     audio_mime: str | None = None
     mode: Literal["type"] | None = Field(None, description='"type" if the user asked to switch to typing.')
     warnings: list[ErrorInfo] = Field(default_factory=list)
+    turn_id: str | None = None
+    actions: list[ActionOut] = Field(default_factory=list)
+    awaiting_results: bool = False
 
 
 _history_adapter = TypeAdapter(list[ChatMessage])
@@ -304,6 +380,41 @@ def me(user: CurrentUser) -> User:
     return user
 
 
+def _settings(voice: str | None) -> Settings:
+    return Settings(
+        voice_model=voice,  # type: ignore[arg-type]
+        voices=[VoiceOption(id=i, label=label, gender=g, previews=_previews(i)) for i, label, g in services.VOICES],
+    )
+
+
+def _previews(voice: str) -> list[VoicePreview]:
+    return [
+        VoicePreview(text=line, url=f"/voice-previews/{voice}/{n}.wav")
+        for n, line in enumerate(services.PREVIEW_LINES, 1)
+        if (PREVIEW_DIR / voice / f"{n}.wav").is_file()
+    ]
+
+
+@app.get("/voice-previews/{voice}/{n}.wav", response_class=FileResponse, responses={200: {"content": {"audio/wav": {}}}})
+def voice_preview(voice: str, n: int) -> FileResponse:
+    """Pre-recorded sample of a voice. Public and cacheable: no TTS call, no quota used."""
+    path = PREVIEW_DIR / voice / f"{n}.wav"
+    if voice not in services.VOICE_IDS or not path.is_file():
+        raise HTTPException(404, "No such voice preview.")
+    return FileResponse(path, media_type="audio/wav", headers={"Cache-Control": "public, max-age=604800, immutable"})
+
+
+@app.get("/v1/settings")
+def get_settings(user: CurrentUser) -> Settings:
+    """User settings. ``voice_model`` is null until the user picks a voice."""
+    return _settings(services.get_voice_model(user.id))
+
+
+@app.patch("/v1/settings")
+def update_settings(body: SettingsUpdate, user: CurrentUser) -> Settings:
+    return _settings(services.set_voice_model(user.id, body.voice_model))
+
+
 def _auth_client() -> Any:
     # A fresh client per call: signing in must never change the shared service client's session.
     return create_client(
@@ -377,10 +488,81 @@ def _remember_turn(user_id: str, message: str, reply: str, source: str) -> None:
         log.warning("memory write failed for %s: %s", user_id, exc.message)
 
 
+def _voice_out(text: str, voice: str | None, user_id: str | None = None) -> tuple[str, bytes | None, list[ErrorInfo]]:
+    """Caption (≤ 40 words, exactly what's spoken) and its audio, in the user's voice."""
+    caption = services.make_caption(text)
+    try:
+        return caption, services.generate_audio(caption, {"voice": services.resolve_voice(user_id, voice)}), []
+    except ServiceError as exc:
+        return caption, None, [ErrorInfo(code=exc.code, message=exc.message)]
+
+
+def _step_response(step: phone_agent.Step, voice: bool, tts_voice: str | None, user_id: str | None = None) -> ChatResponse:
+    resp = ChatResponse(
+        text=step.text,
+        mode=step.mode,  # type: ignore[arg-type]
+        turn_id=step.turn_id,
+        actions=[ActionOut(id=a.id, tool=a.tool, args=a.args) for a in step.actions],
+        awaiting_results=not step.final,
+    )
+    if step.final and voice and step.text:
+        caption, audio, warnings = _voice_out(step.text, tts_voice, user_id)
+        resp.caption = resp.speech_text = caption
+        resp.audio_base64 = base64.b64encode(audio).decode() if audio else None
+        resp.audio_mime = "audio/wav" if audio else None
+        resp.warnings += warnings
+    return resp
+
+
+def _device_for(user: User, device_id: str | None) -> tuple[devices.Device | None, list[ErrorInfo]]:
+    if not device_id:
+        return None, []
+    device = devices.get(user.id, device_id)
+    if device is None or not device.tools:
+        return None, [ErrorInfo(code="device_not_registered",
+                                message="This device hasn't registered its tools; replying without phone actions.")]
+    return device, []
+
+
+@app.post("/v1/devices")
+def register_device(body: DeviceRegistration, user: CurrentUser) -> DeviceRegistered:
+    """Store this phone's capabilities and tool catalog (latest wins)."""
+    device = devices.Device(
+        user_id=user.id, device_id=body.device_id, platform=body.platform, app_version=body.app_version,
+        timezone=body.timezone, push_token=body.push_token, capabilities=body.capabilities,
+        tools=[t.model_dump() for t in body.tools],
+    )
+    persisted = devices.register(device)
+    return DeviceRegistered(device_id=body.device_id, tools=len(body.tools), persisted=persisted)
+
+
+@app.post("/v1/chat/{turn_id}/results")
+def chat_results(turn_id: str, body: ResultsRequest, user: CurrentUser, background: BackgroundTasks) -> ChatResponse:
+    """The phone reports what its actions did; the model takes the next step."""
+    step, user_message = phone_agent.submit_results(
+        user.id, turn_id, body.device_id, [r.model_dump() for r in body.results]
+    )
+    if step.final:
+        background.add_task(_remember_turn, user.id, user_message, step.text, "voice" if body.mode == "talk" else "text")
+    return _step_response(step, body.voice, body.tts_voice, user.id)
+
+
 @app.post("/v1/chat")
 def chat(body: ChatRequest, user: CurrentUser, background: BackgroundTasks) -> ChatResponse:
-    """Generate a reply (and optional audio). Memory is updated after the response is sent."""
-    context: dict[str, Any] = {"history": [m.model_dump() for m in body.history]}
+    """Generate a reply (and optional audio). Memory is updated after the response is sent.
+
+    With a registered ``device_id`` the model may return ``actions`` for the phone
+    instead of (or before) a final reply; see /v1/chat/{turn_id}/results.
+    """
+    history = [m.model_dump() for m in body.history]
+    device, device_warnings = _device_for(user, body.device_id)
+    if device is not None:
+        step = phone_agent.start(user.id, device, body.message, history, body.mode)
+        if step.final:
+            background.add_task(_remember_turn, user.id, body.message, step.text, "voice" if body.voice else "text")
+        return _step_response(step, body.voice, body.tts_voice, user.id)
+
+    context: dict[str, Any] = {"history": history}
     if body.mode:
         context["mode"] = body.mode
     if body.tts_voice:
@@ -395,7 +577,7 @@ def chat(body: ChatRequest, user: CurrentUser, background: BackgroundTasks) -> C
         audio_base64=base64.b64encode(result.audio).decode() if result.audio else None,
         audio_mime="audio/wav" if result.audio else None,
         mode=result.mode,  # type: ignore[arg-type]
-        warnings=[ErrorInfo(code=e.code, message=e.message) for e in result.errors],
+        warnings=device_warnings + [ErrorInfo(code=e.code, message=e.message) for e in result.errors],
     )
 
 
@@ -436,22 +618,46 @@ def talk(
     file: Annotated[UploadFile, File(description="Recording: m4a (iOS/Android) or webm (web), max 25 MB")],
     history: Annotated[str | None, Form(description="JSON array of {role, content}")] = None,
     tts_voice: Annotated[Voice | None, Form()] = None,
+    device_id: Annotated[str | None, Form(max_length=200)] = None,
 ) -> TalkResponse:
-    """One hands-free voice turn: transcribe, reply, caption, speak."""
+    """One hands-free voice turn: transcribe, reply, caption, speak.
+
+    With a registered ``device_id`` the reply may instead carry ``actions`` for the
+    phone; the turn then continues via /v1/chat/{turn_id}/results with voice=true.
+    """
     data = file.file.read(MAX_AUDIO_BYTES + 1)
     if len(data) > MAX_AUDIO_BYTES:
         raise ServiceError("Audio file is too large (max 25 MB).", "audio_too_large")
     turns = _parse_history(history)
     transcript = services.listen(data, file.filename or "audio.m4a", prompt=_whisper_prompt(turns))
 
+    device, device_warnings = _device_for(user, device_id)
+    if device is not None:
+        step = phone_agent.start(user.id, device, transcript, turns, "talk")
+        out = _step_response(step, voice=True, tts_voice=tts_voice, user_id=user.id)
+        if step.final:
+            background.add_task(_remember_turn, user.id, transcript, step.text, "voice")
+        return TalkResponse(
+            transcript=transcript,
+            text=out.text,
+            caption=out.caption or "",
+            audio_base64=out.audio_base64,
+            audio_mime=out.audio_mime,
+            mode="type" if step.mode == "type" else None,
+            warnings=out.warnings,
+            turn_id=out.turn_id,
+            actions=out.actions,
+            awaiting_results=out.awaiting_results,
+        )
+
     context: dict[str, Any] = {"history": turns, "mode": "talk", **({"voice": tts_voice} if tts_voice else {})}
     result = services.run_turn(user.id, transcript, context, voice_mode=False, remember=False)
 
     caption = services.make_caption(result.text)
-    warnings = [ErrorInfo(code=e.code, message=e.message) for e in result.errors]
+    warnings = device_warnings + [ErrorInfo(code=e.code, message=e.message) for e in result.errors]
     audio = None
     try:
-        audio = services.generate_audio(caption, context)
+        audio = services.generate_audio(caption, {**context, "voice": services.resolve_voice(user.id, tts_voice)})
     except ServiceError as exc:
         warnings.append(ErrorInfo(code=exc.code, message=exc.message))
 
@@ -469,7 +675,7 @@ def talk(
 
 @app.post("/v1/speak", response_class=Response, responses={200: {"content": {"audio/wav": {}}}})
 def speak(body: SpeakRequest, user: CurrentUser) -> Response:
-    audio = services.generate_audio(body.text, {"voice": body.voice} if body.voice else None)
+    audio = services.generate_audio(body.text, {"voice": services.resolve_voice(user.id, body.voice)})
     return Response(content=audio, media_type="audio/wav")
 
 
@@ -480,7 +686,7 @@ def speak_reply(body: VoiceReplyRequest, user: CurrentUser) -> VoiceReply:
     warnings: list[ErrorInfo] = []
     audio = None
     try:
-        audio = services.generate_audio(caption, {"voice": body.voice} if body.voice else None)
+        audio = services.generate_audio(caption, {"voice": services.resolve_voice(user.id, body.voice)})
     except ServiceError as exc:
         warnings.append(ErrorInfo(code=exc.code, message=exc.message))
     return VoiceReply(

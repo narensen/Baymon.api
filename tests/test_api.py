@@ -255,3 +255,20 @@ def test_speak_reply_caption(auth: dict[str, str]) -> None:
     assert 0 < len(body["caption"].split()) <= 40 and "```" not in body["caption"]
     if body["audio_base64"] is None:
         assert body["warnings"], "missing audio must come with a warning"
+
+
+def test_settings_voice_round_trip(auth: dict[str, str]) -> None:
+    resp = client.get("/v1/settings", headers=auth)
+    if resp.status_code == 500 and resp.json()["error"]["code"] == "config_missing":
+        pytest.skip("users.voice_model column not created yet")
+    assert resp.status_code == 200, resp.text
+    before = resp.json()["voice_model"]
+    assert {v["id"] for v in resp.json()["voices"]} == {"troy", "austin", "daniel", "autumn", "diana", "hannah"}
+    try:
+        saved = client.patch("/v1/settings", headers=auth, json={"voice_model": "hannah"}).json()
+        assert saved["voice_model"] == "hannah"
+        assert client.get("/v1/settings", headers=auth).json()["voice_model"] == "hannah"
+        bad = client.patch("/v1/settings", headers=auth, json={"voice_model": "pirate"})
+        assert bad.status_code == 422 and bad.json()["error"]["code"] == "invalid_request"
+    finally:
+        client.patch("/v1/settings", headers=auth, json={"voice_model": before})

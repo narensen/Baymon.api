@@ -38,6 +38,25 @@ TEXT_MODEL = os.getenv("BAYMON_TEXT_MODEL", "openai/gpt-oss-120b")
 STT_MODEL = os.getenv("BAYMON_STT_MODEL", "whisper-large-v3-turbo")
 TTS_MODEL = os.getenv("BAYMON_TTS_MODEL", "canopylabs/orpheus-v1-english")
 TTS_VOICE = os.getenv("BAYMON_TTS_VOICE", "troy")
+# Orpheus English voices: (id, label, gender)
+VOICES = (
+    ("troy", "Troy", "male"),
+    ("austin", "Austin", "male"),
+    ("daniel", "Daniel", "male"),
+    ("autumn", "Autumn", "female"),
+    ("diana", "Diana", "female"),
+    ("hannah", "Hannah", "female"),
+)
+VOICE_IDS = tuple(v[0] for v in VOICES)
+# Pre-recorded per voice by scripts/generate_voice_previews.py (served as static files).
+PREVIEW_LINES = (
+    "Hi, I'm Baymon. I'll be the voice that helps you through your day.",
+    "Your gym alarm is set for six thirty tomorrow morning.",
+    "Done! I found the document and sent it to your class group.",
+    "Good morning! You've got two meetings today, and it might rain later, so grab an umbrella.",
+    "Hmm, that build failed. Want me to look at the error and try a fix?",
+    "Nice work today. Get some rest, and I'll remind you about the dentist tomorrow.",
+)
 MEMORY_TABLE = "memory"
 USER_ID_COLUMN = "user_id"
 MEMORY_COLUMN = "memory"
@@ -431,15 +450,76 @@ def insert_to_memory(user_id: str, turn_content: str, metadata: dict | None = No
 
 
 # --------------------------------------------------------------------------
+# User settings (columns on public.users)
+# --------------------------------------------------------------------------
+
+USERS_TABLE = "users"
+_voice_cache: dict[str, tuple[float, str | None]] = {}
+VOICE_CACHE_SECONDS = 60
+
+
+def get_voice_model(user_id: str) -> str | None:
+    """The user's chosen speaking voice, or None if they haven't picked one."""
+    import time
+
+    cached = _voice_cache.get(user_id)
+    if cached and time.monotonic() - cached[0] < VOICE_CACHE_SECONDS:
+        return cached[1]
+    try:
+        rows = _supabase().table(USERS_TABLE).select("voice_model").eq(USER_ID_COLUMN, user_id).limit(1).execute().data
+    except Exception as exc:
+        if "voice_model" in str(exc):
+            raise ServiceError("The users table has no voice_model column yet.", "config_missing") from exc
+        raise ServiceError(f"Couldn't load settings: {exc}", "settings_read") from exc
+    if not rows:
+        raise ServiceError("No users row for this account.", "user_not_found")
+    row: Any = rows[0]
+    voice = row.get("voice_model") if isinstance(row, dict) else None
+    voice = voice if voice in VOICE_IDS else None  # unknown/legacy values count as "not chosen"
+    _voice_cache[user_id] = (time.monotonic(), voice)
+    return voice
+
+
+def set_voice_model(user_id: str, voice: str | None) -> str | None:
+    """Save the user's speaking voice (None clears it)."""
+    import time
+
+    if voice is not None and voice not in VOICE_IDS:
+        raise ServiceError(f"Unknown voice {voice!r}. Choose one of: {', '.join(VOICE_IDS)}.", "invalid_request")
+    try:
+        rows = _supabase().table(USERS_TABLE).update({"voice_model": voice}).eq(USER_ID_COLUMN, user_id).execute().data
+    except Exception as exc:
+        if "voice_model" in str(exc):
+            raise ServiceError("The users table has no voice_model column yet.", "config_missing") from exc
+        raise ServiceError(f"Couldn't save settings: {exc}", "settings_write") from exc
+    if not rows:
+        raise ServiceError("No users row for this account.", "user_not_found")
+    _voice_cache[user_id] = (time.monotonic(), voice)
+    return voice
+
+
+def resolve_voice(user_id: str | None, requested: str | None = None) -> str:
+    """Voice to speak with: the request's, else the user's saved one, else the default."""
+    if requested in VOICE_IDS:
+        return requested  # type: ignore[return-value]
+    if user_id:
+        try:
+            return get_voice_model(user_id) or TTS_VOICE
+        except ServiceError:
+            pass  # never fail speech over a settings lookup
+    return TTS_VOICE
+
+
+# --------------------------------------------------------------------------
 # Text generation
 # --------------------------------------------------------------------------
 
 
-def _generate(user_input: str, session_context: dict, user_id: str) -> tuple[str, str | None]:
-    """Return (reply text, requested mode switch or None)."""
+def build_system_prompt(user_input: str, session_context: dict, user_id: str) -> str:
+    """Persona + mode + reply format + relevant memory, for chat and talk replies."""
     memory = session_context.get("memory")
     if memory is None:
-        memory = retrieve_memory(user_id, user_input)
+        memory = retrieve_memory(user_id, user_input) if user_id else []
 
     system = session_context.get("system_prompt") or DEFAULT_SYSTEM_PROMPT
     mode = session_context.get("mode")
@@ -448,6 +528,13 @@ def _generate(user_input: str, session_context: dict, user_id: str) -> tuple[str
     system += f"\n\n{TALK_FORMATTING_PROMPT if mode == 'talk' else FORMATTING_PROMPT}"
     if memory_text := _format_memory(memory):
         system += f"\n\nWhat you remember about the user:\n{memory_text}"
+    return system
+
+
+def _generate(user_input: str, session_context: dict, user_id: str) -> tuple[str, str | None]:
+    """Return (reply text, requested mode switch or None)."""
+    system = build_system_prompt(user_input, session_context, user_id)
+    mode = session_context.get("mode")
 
     history = session_context.get("history") or []
     messages: list[Any] = [
@@ -709,7 +796,8 @@ def run_turn(
     if voice_mode:
         try:
             result.speech_text = decide_speech_text(result.text)
-            result.audio = generate_audio(result.speech_text, session_context)
+            voice = resolve_voice(user_id, session_context.get("voice"))
+            result.audio = generate_audio(result.speech_text, {**session_context, "voice": voice})
         except ServiceError as exc:
             result.errors.append(exc)
 
