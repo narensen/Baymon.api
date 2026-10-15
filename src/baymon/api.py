@@ -357,7 +357,8 @@ def agent_complete(body: AgentRequest, user: CurrentUser) -> StreamingResponse:
     The client sends the conversation (without a system message) and its tool
     schemas; the server adds the system prompt with the user's memory.
     """
-    system = completions.build_system_prompt(user.id, body.mode, body.environment)
+    query = next((m.content for m in reversed(body.messages) if m.role == "user" and m.content), None)
+    system = completions.build_system_prompt(user.id, body.mode, body.environment, query)
     messages = [{"role": "system", "content": system}] + [m.model_dump(exclude_none=True) for m in body.messages]
     tools = [t.model_dump() for t in body.tools]
     events = completions.stream_completion(body.model, messages, tools, body.max_tokens)

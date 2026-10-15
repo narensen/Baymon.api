@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import io
 import json
+import logging
 import os
 import re
 import struct
@@ -30,6 +31,8 @@ from supabase import Client, create_client
 from baymon.formatting import FORMATTING_PROMPT, TALK_FORMATTING_PROMPT
 
 load_dotenv()
+
+log = logging.getLogger("baymon.services")
 
 TEXT_MODEL = os.getenv("BAYMON_TEXT_MODEL", "openai/gpt-oss-120b")
 STT_MODEL = os.getenv("BAYMON_STT_MODEL", "whisper-large-v3-turbo")
@@ -328,9 +331,20 @@ def _new_memory(content: str, category: str, metadata: dict | None = None) -> di
     }
 
 
-def retrieve_memory(user_id: str) -> list[dict[str, Any]]:
-    """Return the user's memories, most recent last, capped for prompt size."""
-    return _load_memory(user_id)[-MEMORY_PROMPT_LIMIT:]
+def retrieve_memory(user_id: str, query: str | None = None) -> list[dict[str, Any]]:
+    """Memories for a prompt: the ones relevant to ``query`` (vector search) plus recent ones.
+
+    Without a query, or if vector search is unavailable, falls back to the most recent.
+    """
+    items = _load_memory(user_id)
+    if query and query.strip():
+        from baymon import embeddings
+
+        try:
+            return embeddings.relevant(user_id, items, query)
+        except Exception as exc:  # never fail a reply because retrieval is down
+            log.warning("vector memory retrieval failed, using recent memories: %s", exc)
+    return items[-MEMORY_PROMPT_LIMIT:]
 
 
 def list_memory(user_id: str) -> list[dict[str, Any]]:
@@ -425,7 +439,7 @@ def _generate(user_input: str, session_context: dict, user_id: str) -> tuple[str
     """Return (reply text, requested mode switch or None)."""
     memory = session_context.get("memory")
     if memory is None:
-        memory = retrieve_memory(user_id)
+        memory = retrieve_memory(user_id, user_input)
 
     system = session_context.get("system_prompt") or DEFAULT_SYSTEM_PROMPT
     mode = session_context.get("mode")
@@ -685,7 +699,7 @@ def run_turn(
     session_context = dict(session_context or {})
     if "memory" not in session_context:
         try:
-            session_context["memory"] = retrieve_memory(user_id) if user_id else []
+            session_context["memory"] = retrieve_memory(user_id, user_input) if user_id else []
         except ServiceError as exc:
             session_context["memory"] = []
             result.errors.append(exc)

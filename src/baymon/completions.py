@@ -78,13 +78,13 @@ terms, `code` for identifiers and paths, fenced code blocks with a language for 
 Markdown tables only for genuinely tabular data. Do not use HTML or UI tags."""
 
 
-def build_system_prompt(user_id: str, mode: str, environment: dict[str, str]) -> str:
+def build_system_prompt(user_id: str, mode: str, environment: dict[str, str], query: str | None = None) -> str:
     parts = [services.DEFAULT_SYSTEM_PROMPT, services.MODE_PROMPTS.get(mode, services.MODE_PROMPTS["type"]), AGENT_PROMPT]
     parts.append(services.TALK_FORMATTING_PROMPT if mode == "talk" else CLI_FORMATTING_PROMPT)
     if environment:
         parts.append("Environment:\n" + "\n".join(f"- {k}: {v}" for k, v in environment.items()))
     try:
-        memory = services.retrieve_memory(user_id)
+        memory = services.retrieve_memory(user_id, query)
     except ServiceError:
         memory = []
     if memory:
