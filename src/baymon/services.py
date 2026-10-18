@@ -297,22 +297,23 @@ def _load_memory(user_id: str) -> list[dict[str, Any]]:
     return _items(row[0]) if row else []
 
 
-def _mutate(user_id: str, change: Callable[[list[dict[str, Any]]], list[dict[str, Any]]]) -> None:
-    """Apply ``change`` to the user's memory items with optimistic locking on ``version``.
+def mutate_doc(user_id: str, change: Callable[[dict[str, Any]], dict[str, Any]]) -> dict[str, Any]:
+    """Apply ``change`` to the user's whole memory JSON with optimistic locking on ``version``.
 
-    Other keys in the memory JSON are preserved. Retries if another write landed
-    between the read and the update.
+    Retries if another write landed between the read and the update. Returns the new document.
     """
     table = _supabase().table(MEMORY_TABLE)
     for _ in range(MEMORY_WRITE_RETRIES):
         row = _load_row(user_id)
         try:
             if row is None:
-                table.insert({USER_ID_COLUMN: user_id, MEMORY_COLUMN: {"items": change([])}}).execute()
-                return
+                doc = change({})
+                table.insert({USER_ID_COLUMN: user_id, MEMORY_COLUMN: doc}).execute()
+                return doc
             memory, version = row
+            doc = change(dict(memory))
             resp = (
-                table.update({MEMORY_COLUMN: {**memory, "items": change(_items(memory))}, "version": version + 1})
+                table.update({MEMORY_COLUMN: doc, "version": version + 1})
                 .eq(USER_ID_COLUMN, user_id)
                 .eq("version", version)
                 .execute()
@@ -327,8 +328,19 @@ def _mutate(user_id: str, change: Callable[[list[dict[str, Any]]], list[dict[str
                 raise ServiceError("No users row for this account.", "user_not_found") from exc
             raise ServiceError(f"Couldn't save memory: {exc}", "memory_write") from exc
         if resp.data:
-            return
+            return doc
     raise ServiceError("Memory is being updated elsewhere; try again.", "memory_conflict")
+
+
+def load_doc(user_id: str) -> dict[str, Any]:
+    """The user's whole memory JSON ({} if none yet)."""
+    row = _load_row(user_id)
+    return row[0] if row else {}
+
+
+def _mutate(user_id: str, change: Callable[[list[dict[str, Any]]], list[dict[str, Any]]]) -> None:
+    """Apply ``change`` to the user's memory items; other keys in the document are preserved."""
+    mutate_doc(user_id, lambda doc: {**doc, "items": change(_items(doc))})
 
 
 def _append(user_id: str, items: list[dict[str, Any]]) -> None:

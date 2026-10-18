@@ -164,6 +164,15 @@ class Client:
     def memory_observe(self, user_message: str, reply: str) -> None:
         self._send("POST", "/v1/memory/observe", json={"user_message": user_message[:20_000], "reply": reply[:40_000]})
 
+    # --------------------------------------------------------------- nudges
+
+    def nudges_check(self, timezone: str | None, signals: list[dict[str, Any]] | None = None) -> list[dict[str, Any]]:
+        body = {"timezone": timezone, "signals": signals or []}
+        return self._send("POST", "/v1/nudges/check", json=body).json()["nudges"]
+
+    def nudge_feedback(self, nudge_id: str, action: str) -> None:
+        self._send("POST", f"/v1/nudges/{nudge_id}/feedback", json={"action": action})
+
     # ------------------------------------------------------------- settings
 
     def settings(self) -> dict[str, Any]:

@@ -27,7 +27,7 @@ from pydantic import BaseModel, Field, TypeAdapter, ValidationError
 from supabase import ClientOptions, create_client
 from supabase_auth.errors import AuthError
 
-from baymon import completions, devices, phone_agent, services
+from baymon import completions, devices, nudges, phone_agent, services
 from baymon.services import ServiceError
 
 log = logging.getLogger("baymon.api")
@@ -58,6 +58,7 @@ STATUS_BY_CODE = {
     "context_too_long": 413,
     "turn_not_found": 404,
     "turn_busy": 409,
+    "nudge_not_found": 404,
     "groq_unreachable": 503,
     "config_missing": 500,
 }
@@ -204,13 +205,68 @@ class VoiceOption(BaseModel):
     previews: list[VoicePreview] = Field(default_factory=list, description="Pre-recorded sample clips.")
 
 
+HHMM = r"^([01]\d|2[0-3]):[0-5]\d$"
+
+
+class NudgeSettings(BaseModel):
+    enabled: bool = Field(True, description="Whether Baymon may speak up on its own.")
+    quiet_start: str | None = Field("22:00", pattern=HHMM, description="Quiet hours start (local HH:MM); only urgent bubbles.")
+    quiet_end: str | None = Field("08:00", pattern=HHMM)
+    morning_brief: str | None = Field("08:00", pattern=HHMM, description="Local time for the morning brief; null = off.")
+    evening_wrap: str | None = Field("21:00", pattern=HHMM, description="Local time for the evening wrap-up; null = off.")
+
+
+class NudgeSettingsUpdate(BaseModel):
+    enabled: bool | None = None
+    quiet_start: str | None = Field(None, pattern=HHMM)
+    quiet_end: str | None = Field(None, pattern=HHMM)
+    morning_brief: str | None = Field(None, pattern=HHMM)
+    evening_wrap: str | None = Field(None, pattern=HHMM)
+
+
 class Settings(BaseModel):
     voice_model: Voice | None = Field(description="The user's speaking voice; null means not chosen yet (ask the user).")
     voices: list[VoiceOption] = Field(description="All available voices.")
+    nudges: NudgeSettings = Field(default_factory=NudgeSettings, description="When Baymon may speak up on its own.")
 
 
 class SettingsUpdate(BaseModel):
-    voice_model: Voice | None = Field(description="Voice id, or null to clear the choice.")
+    """Only the fields you send are changed."""
+
+    voice_model: Voice | None = Field(None, description="Voice id, or null to clear the choice.")
+    nudges: NudgeSettingsUpdate | None = None
+
+
+class Signal(BaseModel):
+    type: str = Field(min_length=1, max_length=40, description="notification, calendar, screen, battery, location, foreground…")
+    at: str | None = Field(None, max_length=40, description="ISO time it happened (default: now).")
+    data: dict[str, Any] = Field(default_factory=dict)
+
+
+class NudgeCheck(BaseModel):
+    device_id: str | None = Field(None, max_length=200, description="Used for the timezone if timezone isn't sent.")
+    timezone: str | None = Field(None, max_length=64)
+    signals: list[Signal] = Field(default_factory=list, max_length=50)
+
+
+class Nudge(BaseModel):
+    id: str
+    kind: Literal["reminder", "event", "checkin", "followup", "inconsistency", "insight"]
+    urgency: Literal["low", "normal", "high"]
+    text: str = Field(description="The bubble: one short sentence.")
+    detail: str = Field(description="Baymon's opening chat message when the bubble is tapped.")
+    suggestions: list[str] = Field(default_factory=list, description="Quick replies to show in the chat.")
+    created_at: str
+    expires_at: str
+
+
+class NudgeList(BaseModel):
+    nudges: list[Nudge]
+
+
+class NudgeFeedback(BaseModel):
+    action: Literal["opened", "dismissed", "snoozed", "done"]
+    snooze_minutes: int | None = Field(None, ge=5, le=1440)
 
 
 class DeviceToolDef(BaseModel):
@@ -380,9 +436,10 @@ def me(user: CurrentUser) -> User:
     return user
 
 
-def _settings(voice: str | None) -> Settings:
+def _settings(voice: str | None, nudge_settings: dict[str, Any] | None = None) -> Settings:
     return Settings(
         voice_model=voice,  # type: ignore[arg-type]
+        nudges=NudgeSettings(**(nudge_settings or {})),
         voices=[VoiceOption(id=i, label=label, gender=g, previews=_previews(i)) for i, label, g in services.VOICES],
     )
 
@@ -404,15 +461,59 @@ def voice_preview(voice: str, n: int) -> FileResponse:
     return FileResponse(path, media_type="audio/wav", headers={"Cache-Control": "public, max-age=604800, immutable"})
 
 
+def _saved_voice(user_id: str) -> str | None:
+    """The saved voice; None if not chosen or the voice_model column doesn't exist yet."""
+    try:
+        return services.get_voice_model(user_id)
+    except ServiceError as exc:
+        if exc.code != "config_missing":
+            raise
+        log.warning("settings: %s", exc.message)
+        return None
+
+
 @app.get("/v1/settings")
 def get_settings(user: CurrentUser) -> Settings:
     """User settings. ``voice_model`` is null until the user picks a voice."""
-    return _settings(services.get_voice_model(user.id))
+    return _settings(_saved_voice(user.id), nudges.get_settings(user.id))
 
 
 @app.patch("/v1/settings")
 def update_settings(body: SettingsUpdate, user: CurrentUser) -> Settings:
-    return _settings(services.set_voice_model(user.id, body.voice_model))
+    """Change only the fields sent (e.g. {"nudges": {"evening_wrap": null}})."""
+    voice = (services.set_voice_model(user.id, body.voice_model) if "voice_model" in body.model_fields_set
+             else _saved_voice(user.id))
+    nudge_settings = (nudges.update_settings(user.id, {k: getattr(body.nudges, k) for k in body.nudges.model_fields_set})
+                      if body.nudges is not None else nudges.get_settings(user.id))
+    return _settings(voice, nudge_settings)
+
+
+@app.post("/v1/nudges/check")
+def nudges_check(body: NudgeCheck, user: CurrentUser) -> NudgeList:
+    """Send new phone signals and get any bubbles Baymon wants to show now.
+
+    Call on app foreground, on notable events (notification, calendar, screen change)
+    and from background fetch (~15 min). Usually returns quickly with nothing; the model
+    is only consulted when something changed.
+    """
+    tz = body.timezone
+    if not tz and body.device_id and (device := devices.get(user.id, body.device_id)):
+        tz = device.timezone
+    found = nudges.check(user.id, [s.model_dump() for s in body.signals], tz)
+    return NudgeList(nudges=[Nudge(**n) for n in found])
+
+
+@app.get("/v1/nudges")
+def nudges_active(user: CurrentUser) -> NudgeList:
+    """Bubbles shown but not yet opened, dismissed or expired (to restore after an app restart)."""
+    return NudgeList(nudges=[Nudge(**n) for n in nudges.active(user.id)])
+
+
+@app.post("/v1/nudges/{nudge_id}/feedback", status_code=204)
+def nudges_feedback(nudge_id: str, body: NudgeFeedback, user: CurrentUser) -> Response:
+    """What the user did with a bubble. Snoozed bubbles come back after snooze_minutes."""
+    nudges.feedback(user.id, nudge_id, body.action, body.snooze_minutes)
+    return Response(status_code=204)
 
 
 def _auth_client() -> Any:
@@ -544,6 +645,7 @@ def chat_results(turn_id: str, body: ResultsRequest, user: CurrentUser, backgrou
     )
     if step.final:
         background.add_task(_remember_turn, user.id, user_message, step.text, "voice" if body.mode == "talk" else "text")
+        background.add_task(nudges.record_activity, user.id, user_message, step.text)
     return _step_response(step, body.voice, body.tts_voice, user.id)
 
 

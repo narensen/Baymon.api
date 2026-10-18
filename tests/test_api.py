@@ -259,16 +259,40 @@ def test_speak_reply_caption(auth: dict[str, str]) -> None:
 
 def test_settings_voice_round_trip(auth: dict[str, str]) -> None:
     resp = client.get("/v1/settings", headers=auth)
-    if resp.status_code == 500 and resp.json()["error"]["code"] == "config_missing":
-        pytest.skip("users.voice_model column not created yet")
     assert resp.status_code == 200, resp.text
     before = resp.json()["voice_model"]
     assert {v["id"] for v in resp.json()["voices"]} == {"troy", "austin", "daniel", "autumn", "diana", "hannah"}
+    first = client.patch("/v1/settings", headers=auth, json={"voice_model": "hannah"})
+    if first.status_code == 500 and first.json()["error"]["code"] == "config_missing":
+        pytest.skip("users.voice_model column not created yet")
     try:
-        saved = client.patch("/v1/settings", headers=auth, json={"voice_model": "hannah"}).json()
+        saved = first.json()
         assert saved["voice_model"] == "hannah"
         assert client.get("/v1/settings", headers=auth).json()["voice_model"] == "hannah"
         bad = client.patch("/v1/settings", headers=auth, json={"voice_model": "pirate"})
         assert bad.status_code == 422 and bad.json()["error"]["code"] == "invalid_request"
     finally:
         client.patch("/v1/settings", headers=auth, json={"voice_model": before})
+
+
+
+def test_nudge_settings_partial_update(auth: dict[str, str]) -> None:
+    before = client.get("/v1/settings", headers=auth).json()["nudges"]
+    try:
+        r = client.patch("/v1/settings", headers=auth, json={"nudges": {"evening_wrap": None, "quiet_start": "23:00"}})
+        assert r.status_code == 200, r.text
+        got = r.json()["nudges"]
+        assert got["evening_wrap"] is None and got["quiet_start"] == "23:00"
+        assert got["morning_brief"] == before["morning_brief"]  # untouched fields stay
+        bad = client.patch("/v1/settings", headers=auth, json={"nudges": {"quiet_end": "25:99"}})
+        assert bad.status_code == 422
+    finally:
+        client.patch("/v1/settings", headers=auth, json={"nudges": before})
+
+
+def test_nudges_check_and_feedback_shape(auth: dict[str, str]) -> None:
+    r = client.post("/v1/nudges/check", headers=auth, json={"timezone": "Asia/Kolkata", "signals": [{"type": "foreground"}]})
+    assert r.status_code == 200 and isinstance(r.json()["nudges"], list)
+    assert client.get("/v1/nudges", headers=auth).status_code == 200
+    missing = client.post("/v1/nudges/ndg_missing/feedback", headers=auth, json={"action": "opened"})
+    assert missing.status_code == 404 and missing.json()["error"]["code"] == "nudge_not_found"

@@ -6,9 +6,12 @@ import getpass
 import os
 import re
 import sys
+import threading
+import time
 from collections.abc import Callable
 from pathlib import Path
 
+from rich.panel import Panel
 from rich.table import Table
 from rich.text import Text
 
@@ -90,6 +93,21 @@ def sign_in(client: Client, ui: UI, ask_server: bool = False, method: str | None
     return _email_login(client, ui)
 
 
+def _local_timezone() -> str | None:
+    """IANA name of this machine's timezone, if it can be found."""
+    if tz := os.environ.get("TZ"):
+        return tz.lstrip(":")
+    try:
+        return Path("/etc/timezone").read_text().strip() or None
+    except OSError:
+        pass
+    try:
+        target = os.path.realpath("/etc/localtime")
+        return target.split("zoneinfo/", 1)[1] if "zoneinfo/" in target else None
+    except OSError:
+        return None
+
+
 class Session:
     def __init__(self, client: Client, config: Config, ui: UI, cwd: Path, mode: str) -> None:
         self.client = client
@@ -99,6 +117,8 @@ class Session:
         self.mode = mode
         self.last_reply = ""
         self._prompt: Callable[[], str] = self._make_prompt()
+        self._pending_nudges: list[dict] = []
+        self._last_nudge_check = -1e9
 
     # ------------------------------------------------------------ input
 
@@ -134,11 +154,51 @@ class Session:
 
     # ------------------------------------------------------------- loop
 
+    # ------------------------------------------------------------ nudges
+
+    NUDGE_INTERVAL = 600  # seconds between "anything to say?" checks
+
+    def _start_nudge_check(self, wait: float = 0) -> None:
+        """Ask the server in the background whether Baymon wants to say something."""
+        if time.monotonic() - self._last_nudge_check < self.NUDGE_INTERVAL:
+            return
+        self._last_nudge_check = time.monotonic()
+
+        def work() -> None:
+            try:
+                self._pending_nudges += self.client.nudges_check(_local_timezone())
+            except Exception:
+                pass  # bubbles are best-effort
+
+        thread = threading.Thread(target=work, daemon=True)
+        thread.start()
+        if wait:
+            thread.join(wait)
+
+    def _show_nudges(self) -> None:
+        while self._pending_nudges:
+            n = self._pending_nudges.pop(0)
+            style = "red" if n["urgency"] == "high" else "magenta"
+            body = Text.assemble((n["text"], "bold"), "\n\n", n["detail"])
+            if n.get("suggestions"):
+                body.append("\n\n" + "  ·  ".join(n["suggestions"]), style="muted")
+            self.ui.console.print(Panel(body, title=f"💬 Baymon · {n['kind']}", title_align="left",
+                                        border_style=style, expand=False))
+            # Replying continues from the bubble, like tapping it in the app.
+            self.agent.messages.append({"role": "assistant", "content": n["detail"]})
+            try:
+                self.client.nudge_feedback(n["id"], "opened")
+            except ApiError:
+                pass
+
     def run(self, first_prompt: str | None = None) -> None:
         self._banner()
+        self._start_nudge_check(wait=6)
         if first_prompt:
             self.handle(first_prompt)
         while True:
+            self._show_nudges()
+            self._start_nudge_check()
             try:
                 if self.mode == "talk":
                     line = self._listen()
