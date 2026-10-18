@@ -23,11 +23,11 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse, Response, StreamingResponse
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
-from pydantic import BaseModel, Field, TypeAdapter, ValidationError
+from pydantic import BaseModel, ConfigDict, Field, TypeAdapter, ValidationError, model_validator
 from supabase import ClientOptions, create_client
 from supabase_auth.errors import AuthError
 
-from baymon import completions, devices, nudges, phone_agent, services
+from baymon import attachments, automations, completions, devices, history, nudges, phone_agent, services
 from baymon.services import ServiceError
 
 log = logging.getLogger("baymon.api")
@@ -59,6 +59,13 @@ STATUS_BY_CODE = {
     "turn_not_found": 404,
     "turn_busy": 409,
     "nudge_not_found": 404,
+    "trigger_not_found": 404,
+    "routine_not_found": 404,
+    "attachment_not_found": 404,
+    "too_large": 413,
+    "unsupported_file": 415,
+    "extraction_failed": 502,
+    "limit_reached": 409,
     "groq_unreachable": 503,
     "config_missing": 500,
 }
@@ -172,6 +179,7 @@ class ChatRequest(BaseModel):
     )
     tts_voice: Voice | None = None
     device_id: str | None = Field(None, max_length=200, description="Registered phone whose tools the model may use.")
+    attachments: list[str] = Field(default_factory=list, max_length=5, description="Ids from POST /v1/attachments.")
 
 
 class ActionOut(BaseModel):
@@ -214,20 +222,33 @@ class NudgeSettings(BaseModel):
     quiet_end: str | None = Field("08:00", pattern=HHMM)
     morning_brief: str | None = Field("08:00", pattern=HHMM, description="Local time for the morning brief; null = off.")
     evening_wrap: str | None = Field("21:00", pattern=HHMM, description="Local time for the evening wrap-up; null = off.")
+    digest: bool = Field(True, description="Hold low-urgency nudges for the evening wrap.")
+    weekly_review: str | None = Field("18:00", pattern=HHMM, description="Local time of the weekly review; null = off.")
+    weekly_review_day: int = Field(7, ge=1, le=7, description="ISO weekday: 1 = Monday, 7 = Sunday.")
 
 
 class NudgeSettingsUpdate(BaseModel):
+    """Every field optional; only the fields sent change (null turns a time off)."""
+
     enabled: bool | None = None
     quiet_start: str | None = Field(None, pattern=HHMM)
     quiet_end: str | None = Field(None, pattern=HHMM)
     morning_brief: str | None = Field(None, pattern=HHMM)
     evening_wrap: str | None = Field(None, pattern=HHMM)
+    digest: bool | None = None
+    weekly_review: str | None = Field(None, pattern=HHMM)
+    weekly_review_day: int | None = Field(None, ge=1, le=7)
+
+
+class HistorySettings(BaseModel):
+    retention_days: Literal[0, 30, 90, 365] = Field(90, description="0 = keep no history (and stop writing).")
 
 
 class Settings(BaseModel):
     voice_model: Voice | None = Field(description="The user's speaking voice; null means not chosen yet (ask the user).")
     voices: list[VoiceOption] = Field(description="All available voices.")
     nudges: NudgeSettings = Field(default_factory=NudgeSettings, description="When Baymon may speak up on its own.")
+    history: HistorySettings = Field(default_factory=HistorySettings)
 
 
 class SettingsUpdate(BaseModel):
@@ -235,6 +256,7 @@ class SettingsUpdate(BaseModel):
 
     voice_model: Voice | None = Field(None, description="Voice id, or null to clear the choice.")
     nudges: NudgeSettingsUpdate | None = None
+    history: HistorySettings | None = None
 
 
 class Signal(BaseModel):
@@ -249,6 +271,13 @@ class NudgeCheck(BaseModel):
     signals: list[Signal] = Field(default_factory=list, max_length=50)
 
 
+class NudgeDraft(BaseModel):
+    text: str = Field(min_length=1, max_length=1000)
+    to: str | None = Field(None, max_length=80)
+    app: str | None = Field(None, max_length=60)
+    reply_key: str | None = Field(None, max_length=500, description="Notification key: Send replies inline on the phone.")
+
+
 class Nudge(BaseModel):
     id: str
     kind: Literal["reminder", "event", "checkin", "followup", "inconsistency", "insight"]
@@ -258,6 +287,7 @@ class Nudge(BaseModel):
     suggestions: list[str] = Field(default_factory=list, description="Quick replies to show in the chat.")
     created_at: str
     expires_at: str
+    draft: NudgeDraft | None = Field(None, description="A reply Baymon proposes; sent only when the user taps Send.")
 
 
 class NudgeList(BaseModel):
@@ -267,6 +297,79 @@ class NudgeList(BaseModel):
 class NudgeFeedback(BaseModel):
     action: Literal["opened", "dismissed", "snoozed", "done"]
     snooze_minutes: int | None = Field(None, ge=5, le=1440)
+    reason: Literal["not_useful", "wrong_time", "draft_sent"] | None = None
+
+
+# --- Reminders ("remind me when…") and routines ---------------------------
+
+
+class PlaceWhen(BaseModel):
+    type: Literal["place"]
+    place: str = Field(min_length=1, max_length=40)
+    on: Literal["arrive", "leave"] = "arrive"
+
+
+class MessageWhen(BaseModel):
+    model_config = ConfigDict(populate_by_name=True, serialize_by_alias=True)
+    type: Literal["message"]
+    from_: str = Field(alias="from", min_length=1, max_length=80)
+    app: str | None = Field(None, max_length=60)
+
+
+class AppWhen(BaseModel):
+    type: Literal["app"]
+    app: str = Field(min_length=1, max_length=60)
+
+
+class NotificationWhen(BaseModel):
+    type: Literal["notification"]
+    app: str | None = Field(None, max_length=60)
+    contains: str | None = Field(None, max_length=80)
+
+    @model_validator(mode="after")
+    def _one_of(self) -> "NotificationWhen":
+        if not (self.app or self.contains):
+            raise ValueError("notification triggers need app or contains")
+        return self
+
+
+When = Annotated[PlaceWhen | MessageWhen | AppWhen | NotificationWhen, Field(discriminator="type")]
+
+
+class Trigger(BaseModel):
+    id: str
+    when: When
+    say: str = Field(min_length=1, max_length=160)
+    repeat: bool = False
+    routine_id: str | None = None
+    created_at: str
+    last_fired_at: str | None = None
+
+
+class TriggerList(BaseModel):
+    items: list[Trigger]
+
+
+class Routine(BaseModel):
+    id: str
+    name: str = Field(min_length=1, max_length=40)
+    steps: list[Annotated[str, Field(min_length=1, max_length=200)]] = Field(min_length=1, max_length=12)
+    created_at: str
+    last_run_at: str | None = None
+
+
+class RoutineList(BaseModel):
+    items: list[Routine]
+
+
+class Attachment(BaseModel):
+    id: str
+    kind: Literal["image", "pdf", "text", "file"]
+    name: str
+    mime: str
+    size: int
+    text: str = ""
+    created_at: str
 
 
 class DeviceToolDef(BaseModel):
@@ -327,6 +430,7 @@ class MemoryCreate(BaseModel):
 class MemoryUpdate(BaseModel):
     content: str | None = Field(None, min_length=1, max_length=services.MEMORY_MAX_CHARS)
     category: Category | None = None
+    metadata: dict[str, Any] | None = Field(None, description="Merged (shallowly) into the existing metadata.")
 
 
 class MemoryImport(BaseModel):
@@ -436,10 +540,12 @@ def me(user: CurrentUser) -> User:
     return user
 
 
-def _settings(voice: str | None, nudge_settings: dict[str, Any] | None = None) -> Settings:
+def _settings(voice: str | None, nudge_settings: dict[str, Any] | None = None,
+              history_settings: dict[str, Any] | None = None) -> Settings:
     return Settings(
         voice_model=voice,  # type: ignore[arg-type]
-        nudges=NudgeSettings(**(nudge_settings or {})),
+        nudges=NudgeSettings(**{k: v for k, v in (nudge_settings or {}).items() if k in NudgeSettings.model_fields}),
+        history=HistorySettings(**(history_settings or {})),
         voices=[VoiceOption(id=i, label=label, gender=g, previews=_previews(i)) for i, label, g in services.VOICES],
     )
 
@@ -475,7 +581,7 @@ def _saved_voice(user_id: str) -> str | None:
 @app.get("/v1/settings")
 def get_settings(user: CurrentUser) -> Settings:
     """User settings. ``voice_model`` is null until the user picks a voice."""
-    return _settings(_saved_voice(user.id), nudges.get_settings(user.id))
+    return _settings(_saved_voice(user.id), nudges.get_settings(user.id), history.get_settings(user.id))
 
 
 @app.patch("/v1/settings")
@@ -485,7 +591,9 @@ def update_settings(body: SettingsUpdate, user: CurrentUser) -> Settings:
              else _saved_voice(user.id))
     nudge_settings = (nudges.update_settings(user.id, {k: getattr(body.nudges, k) for k in body.nudges.model_fields_set})
                       if body.nudges is not None else nudges.get_settings(user.id))
-    return _settings(voice, nudge_settings)
+    history_settings = (history.update_settings(user.id, body.history.retention_days)
+                        if body.history is not None else history.get_settings(user.id))
+    return _settings(voice, nudge_settings, history_settings)
 
 
 @app.post("/v1/nudges/check")
@@ -512,7 +620,7 @@ def nudges_active(user: CurrentUser) -> NudgeList:
 @app.post("/v1/nudges/{nudge_id}/feedback", status_code=204)
 def nudges_feedback(nudge_id: str, body: NudgeFeedback, user: CurrentUser) -> Response:
     """What the user did with a bubble. Snoozed bubbles come back after snooze_minutes."""
-    nudges.feedback(user.id, nudge_id, body.action, body.snooze_minutes)
+    nudges.feedback(user.id, nudge_id, body.action, body.snooze_minutes, body.reason)
     return Response(status_code=204)
 
 
@@ -582,9 +690,9 @@ def agent_complete(body: AgentRequest, user: CurrentUser) -> StreamingResponse:
     return StreamingResponse(ndjson(), media_type="application/x-ndjson")
 
 
-def _remember_turn(user_id: str, message: str, reply: str, source: str) -> None:
+def _remember_turn(user_id: str, message: str, reply: str, source: str, tz: str | None = None) -> None:
     try:
-        services.insert_to_memory(user_id, f"User: {message}\nAssistant: {reply}", {"source": source})
+        services.insert_to_memory(user_id, f"User: {message}\nAssistant: {reply}", {"source": source}, tz)
     except ServiceError as exc:
         log.warning("memory write failed for %s: %s", user_id, exc.message)
 
@@ -644,7 +752,9 @@ def chat_results(turn_id: str, body: ResultsRequest, user: CurrentUser, backgrou
         user.id, turn_id, body.device_id, [r.model_dump() for r in body.results]
     )
     if step.final:
-        background.add_task(_remember_turn, user.id, user_message, step.text, "voice" if body.mode == "talk" else "text")
+        device = devices.get(user.id, body.device_id)
+        tz = device.timezone if device else None
+        background.add_task(_remember_turn, user.id, user_message, step.text, "voice" if body.mode == "talk" else "text", tz)
         background.add_task(nudges.record_activity, user.id, user_message, step.text)
     return _step_response(step, body.voice, body.tts_voice, user.id)
 
@@ -657,21 +767,26 @@ def chat(body: ChatRequest, user: CurrentUser, background: BackgroundTasks) -> C
     instead of (or before) a final reply; see /v1/chat/{turn_id}/results.
     """
     history = [m.model_dump() for m in body.history]
+    # Attached files reach the model in this turn's message only (never in history).
+    message = attachments.inject(body.message, attachments.get_many(user.id, body.attachments))
     device, device_warnings = _device_for(user, body.device_id)
+    source = "voice" if body.voice else "text"
     if device is not None:
-        step = phone_agent.start(user.id, device, body.message, history, body.mode)
+        step = phone_agent.start(user.id, device, message, history, body.mode)
         if step.final:
-            background.add_task(_remember_turn, user.id, body.message, step.text, "voice" if body.voice else "text")
+            background.add_task(_remember_turn, user.id, message, step.text, source, device.timezone or None)
         return _step_response(step, body.voice, body.tts_voice, user.id)
 
-    context: dict[str, Any] = {"history": history}
+    known = devices.get(user.id, body.device_id) if body.device_id else None
+    tz = known.timezone if known else None
+    context: dict[str, Any] = {"history": history, "timezone": tz}
     if body.mode:
         context["mode"] = body.mode
     if body.tts_voice:
         context["voice"] = body.tts_voice
 
-    result = services.run_turn(user.id, body.message, context, voice_mode=body.voice, remember=False)
-    background.add_task(_remember_turn, user.id, body.message, result.text, "voice" if body.voice else "text")
+    result = services.run_turn(user.id, message, context, voice_mode=body.voice, remember=False)
+    background.add_task(_remember_turn, user.id, message, result.text, source, tz)
 
     return ChatResponse(
         text=result.text,
@@ -738,7 +853,7 @@ def talk(
         step = phone_agent.start(user.id, device, transcript, turns, "talk")
         out = _step_response(step, voice=True, tts_voice=tts_voice, user_id=user.id)
         if step.final:
-            background.add_task(_remember_turn, user.id, transcript, step.text, "voice")
+            background.add_task(_remember_turn, user.id, transcript, step.text, "voice", device.timezone or None)
         return TalkResponse(
             transcript=transcript,
             text=out.text,
@@ -799,6 +914,56 @@ def speak_reply(body: VoiceReplyRequest, user: CurrentUser) -> VoiceReply:
     )
 
 
+@app.get("/v1/triggers")
+def get_triggers(user: CurrentUser) -> TriggerList:
+    """Context reminders ("remind me when…"), newest first. Created by the model via trigger_create."""
+    return TriggerList(items=[Trigger.model_validate(t) for t in automations.list_triggers(user.id)])
+
+
+@app.delete("/v1/triggers/{trigger_id}", status_code=204)
+def delete_trigger(trigger_id: str, user: CurrentUser) -> Response:
+    automations.delete_trigger(user.id, trigger_id)
+    return Response(status_code=204)
+
+
+@app.get("/v1/routines")
+def get_routines(user: CurrentUser) -> RoutineList:
+    """Saved routines, sorted by name. Run one by sending a chat message (the model calls routine_run)."""
+    return RoutineList(items=[Routine.model_validate(r) for r in automations.list_routines(user.id)])
+
+
+@app.delete("/v1/routines/{routine_id}", status_code=204)
+def delete_routine(routine_id: str, user: CurrentUser) -> Response:
+    """Triggers that pointed at it get routine_id = null."""
+    found = next((r for r in automations.list_routines(user.id) if r.get("id") == routine_id), None)
+    if found is None:
+        raise ServiceError("No such routine.", "routine_not_found")
+    automations.delete_routine(user.id, routine_id)
+    return Response(status_code=204)
+
+
+@app.post("/v1/attachments", status_code=201)
+def upload_attachment(
+    user: CurrentUser,
+    file: Annotated[UploadFile, File(description="Image, PDF, text or any file; max 20 MB")],
+    name: Annotated[str | None, Form(max_length=200)] = None,
+    mime: Annotated[str | None, Form(max_length=100)] = None,
+) -> Attachment:
+    """Upload a shared file; its text is extracted once and reused by id in /v1/chat."""
+    data = file.file.read(attachments.MAX_BYTES + 1)
+    if len(data) > attachments.MAX_BYTES:
+        raise ServiceError("That file is over 20 MB.", "too_large")
+    record = attachments.save(user.id, data, name or file.filename, mime or file.content_type)
+    return Attachment.model_validate({k: v for k, v in record.items() if k != "user_id"})
+
+
+@app.delete("/v1/history", status_code=204)
+def delete_history(user: CurrentUser) -> Response:
+    """Delete everything Baymon noticed (settings are unchanged)."""
+    history.delete_all(user.id)
+    return Response(status_code=204)
+
+
 @app.post("/v1/memory/observe", status_code=202)
 def observe(body: ObserveRequest, user: CurrentUser, background: BackgroundTasks) -> dict[str, bool]:
     """Let the AI learn from a finished turn, in the background."""
@@ -826,7 +991,7 @@ def import_memory(body: MemoryImport, user: CurrentUser) -> MemoryList:
 
 @app.patch("/v1/memory/{memory_id}")
 def edit_memory(memory_id: str, body: MemoryUpdate, user: CurrentUser) -> Memory:
-    return Memory.model_validate(services.update_memory(user.id, memory_id, body.content, body.category))
+    return Memory.model_validate(services.update_memory(user.id, memory_id, body.content, body.category, body.metadata))
 
 
 @app.delete("/v1/memory/{memory_id}", status_code=204)

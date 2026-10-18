@@ -8,7 +8,7 @@ from typing import Any
 
 import pytest
 
-from baymon import nudges, services
+from baymon import history, nudges, services
 
 
 class Store:
@@ -31,6 +31,10 @@ def env(monkeypatch: pytest.MonkeyPatch):  # type: ignore[no-untyped-def]
     monkeypatch.setattr(services, "load_doc", store.load)
     monkeypatch.setattr(services, "mutate_doc", store.mutate)
     monkeypatch.setattr(services, "retrieve_memory", lambda uid, q=None: store.doc["items"])
+    monkeypatch.setattr(services, "list_memory", lambda uid: store.doc["items"])
+    monkeypatch.setattr(history, "record", lambda uid, signals, days: 0)
+    monkeypatch.setattr(history, "purge", lambda uid, days: None)
+    monkeypatch.setattr(history, "week_stats", lambda uid: {"apps": [], "people": []})
 
     def ask(context: str) -> list[dict[str, Any]]:
         calls.append(context)
@@ -40,7 +44,8 @@ def env(monkeypatch: pytest.MonkeyPatch):  # type: ignore[no-untyped-def]
     # Fixed clock: 14:00 UTC on a Sunday; settings without quiet hours/check-ins unless a test sets them.
     clock = {"now": datetime(2026, 10, 18, 14, 0, tzinfo=timezone.utc)}
     monkeypatch.setattr(nudges, "_now", lambda: clock["now"])
-    store.doc["assistant"] = {"settings": {"quiet_start": None, "quiet_end": None, "morning_brief": None, "evening_wrap": None}}
+    store.doc["assistant"] = {"settings": {"quiet_start": None, "quiet_end": None, "morning_brief": None,
+                                           "evening_wrap": None, "weekly_review": None}}
     return store, calls, replies, clock
 
 

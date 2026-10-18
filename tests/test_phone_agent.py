@@ -8,7 +8,7 @@ from typing import Any
 
 import pytest
 
-from baymon import phone_agent, services
+from baymon import phone_agent, server_tools, services
 from baymon.devices import Device
 from baymon.services import ServiceError
 
@@ -158,9 +158,9 @@ def test_routed_turn_gets_subset_plus_request_tools(model, device: Device, monke
     ])
     monkeypatch.setattr(phone_agent, "route", lambda msg, hist, available: {"time"})
     step = phone_agent.start("u1", device, "set an alarm", [], None)
-    first = [t["function"]["name"] for t in fake.requests[0]["tools"]]
+    first = [t["function"]["name"] for t in fake.requests[0]["tools"] if t["function"]["name"] not in server_tools.NAMES]
     assert first == ["alarm_set", "request_tools"]
-    meta = fake.requests[0]["tools"][-1]["function"]
+    meta = next(t["function"] for t in fake.requests[0]["tools"] if t["function"]["name"] == "request_tools")
     assert "screen" in meta["parameters"]["properties"]["groups"]["items"]["enum"]
     second = {t["function"]["name"] for t in fake.requests[1]["tools"]}
     assert {"screen_read", "screen_tap", "app_install"} <= second  # screen brings apps along
@@ -179,4 +179,5 @@ def test_routing_failure_sends_all_tools(model, device: Device, monkeypatch: pyt
     fake = model([msg("hi")])
     monkeypatch.setattr(phone_agent, "route", lambda msg, hist, available: None)
     phone_agent.start("u1", device, "x", [], None)
-    assert len(fake.requests[0]["tools"]) == len(device.tools)
+    phone = [t for t in fake.requests[0]["tools"] if t["function"]["name"] not in server_tools.NAMES]
+    assert len(phone) == len(device.tools)
