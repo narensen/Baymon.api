@@ -304,11 +304,19 @@ def _feedback_summary(state: dict[str, Any], tz: Any, now: datetime) -> str:
 
 
 def _context(user_id: str, state: dict[str, Any], plan: Plan, local: datetime, new_count: int) -> str:
-    now = _now()
+    """Gather the user's data and render the decision prompt."""
     signals = state["signals"]
     query = " ".join(json.dumps(s["data"], ensure_ascii=False)[:200] for s in signals[-new_count:]) if new_count else ""
     memory = services.retrieve_memory(user_id, query or None)
     all_items = services.list_memory(user_id)
+    stats = history.week_stats(user_id) if "weekly review" in plan.due else {"apps": [], "people": []}
+    return render_context(state, plan, local, new_count, memory, all_items, stats, _now())
+
+
+def render_context(state: dict[str, Any], plan: Plan, local: datetime, new_count: int, memory: list[dict[str, Any]],
+                   all_items: list[dict[str, Any]], stats: dict[str, Any], now: datetime) -> str:
+    """The exact text the nudge model reads. Pure (no I/O), so training data matches production."""
+    signals = state["signals"]
     recent_log = [n for n in state["log"] if (_parse(n.get("at")) or now) > now - timedelta(hours=24)
                   and n.get("status") not in ("held", "digested", "dropped")]
     parts = [
@@ -353,7 +361,6 @@ def _context(user_id: str, state: dict[str, Any], plan: Plan, local: datetime, n
         week_ago = now - timedelta(days=7)
         done = [m for m in all_items if (m.get("metadata") or {}).get("kind") == "commitment"
                 and (m.get("metadata") or {}).get("status") == "done" and (_parse(m.get("updated_at")) or week_ago) >= week_ago]
-        stats = history.week_stats(user_id)
         parts.append("For the weekly review:\n"
                      + "Tasks Baymon did this week:\n" + ("\n".join(
                          f"- {a['request']} → {a['outcome']}" for a in state["activity"]
